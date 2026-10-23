@@ -25,55 +25,86 @@
 
 ## Quick start
 
-### 1. Download file `.sh` dari GitHub
+### 1. Download file `.sh` dari GitHub dan jalankan
 
-Gunakan **salah satu** perintah berikut. Perintah ini **hanya mengunduh file**, tidak menjalankan audit maupun upgrade.
-
-**Dengan `curl`:**
+Unduh file melalui `curl`:
 
 ```bash
 curl -fL --retry 3 -o ubuntu-maintenance-v03.sh https://raw.githubusercontent.com/vaisaldarmawan/updatephpandnodejs/main/ubuntu-maintenance-v03.sh
 ```
 
-**Atau dengan `wget`:**
+Jika file sudah ada di direktori saat ini, **jalankan audit**:
 
 ```bash
-wget -O ubuntu-maintenance-v03.sh https://raw.githubusercontent.com/vaisaldarmawan/updatephpandnodejs/main/ubuntu-maintenance-v03.sh
+sudo bash ubuntu-maintenance-v03.sh --audit
 ```
 
-Berikan izin eksekusi (opsional jika menjalankannya dengan `bash`):
+Perintah audit **tidak melakukan upgrade ataupun restart**. Anda juga dapat menjalankannya tanpa `sudo`, tetapi informasi proses/service mungkin lebih terbatas.
 
-```bash
-chmod +x ubuntu-maintenance-v03.sh
-```
+### 2. Download dan jalankan audit — satu baris
 
-Sebaiknya **periksa isi file** sebelum menjalankannya sebagai root, misalnya dengan `less ubuntu-maintenance-v03.sh`.
-
-### 2. Audit server — satu baris (tanpa upgrade)
-
-Unduh skrip dari GitHub lalu jalankan audit dalam **satu perintah**:
+Jika belum mengunduh file, gunakan satu perintah berikut untuk download **sekaligus menjalankan audit**:
 
 ```bash
 curl -fsSLo /tmp/ubuntu-maintenance-v03.sh https://raw.githubusercontent.com/vaisaldarmawan/updatephpandnodejs/main/ubuntu-maintenance-v03.sh && sudo bash /tmp/ubuntu-maintenance-v03.sh --audit
 ```
 
-Perintah ini **hanya melakukan audit**, tidak meng-upgrade paket maupun me-restart service.
-
 > [!CAUTION]
-> URL `main` dapat berubah ketika repository diperbarui. Untuk server produksi, **periksa isi skrip dan gunakan URL dengan full commit SHA** yang sudah Anda setujui sebelum mengeksekusinya sebagai root. Hindari pola `curl | sudo bash` tanpa pemeriksaan.
+> Skrip dari branch `main` dapat berubah kapan saja. Untuk server produksi, tinjau isinya terlebih dahulu dan gunakan URL yang di-*pin* ke full commit SHA yang disetujui; jangan mengeksekusi konten jarak jauh sebagai root tanpa pemeriksaan.
 
-## Upgrade (opsional)
+## Menjalankan upgrade dan restart
 
-Jika Anda menggunakan unduhan satu baris pada langkah 2, setelah menyiapkan health check aplikasi jalankan:
+`--apply` menjalankan **`apt-get update` + `apt-get upgrade` untuk seluruh paket APT yang tersedia**, lalu restart service yang memenuhi kriteria. Karena itu, gunakan hanya sesudah audit, backup/snapshot, dan penjadwalan maintenance.
+
+**Jika file `.sh` sudah diunduh ke direktori saat ini:**
 
 ```bash
-sudo bash /tmp/ubuntu-maintenance-v03.sh --apply --health-file /etc/ubuntu-maintenance/healthchecks.tsv
+sudo bash ubuntu-maintenance-v03.sh --apply --health-file /etc/ubuntu-maintenance/healthchecks.tsv
 ```
 
-File health check harus sudah tersedia. Format setiap baris: `nama|url|expected_http_status` (contoh: `api|http://127.0.0.1:3000/health|200`). `--apply` membutuhkan hak root dan secara default menolak upgrade tanpa health check yang valid. Opsi `--allow-unverified` dapat melewati pemeriksaan tersebut, tetapi **tidak disarankan di produksi**.
+**Jika ingin download dari GitHub lalu langsung menjalankan upgrade dalam satu baris:**
+
+```bash
+curl -fsSLo /tmp/ubuntu-maintenance-v03.sh https://raw.githubusercontent.com/vaisaldarmawan/updatephpandnodejs/main/ubuntu-maintenance-v03.sh && sudo bash /tmp/ubuntu-maintenance-v03.sh --apply --health-file /etc/ubuntu-maintenance/healthchecks.tsv
+```
 
 > [!WARNING]
-> **`--apply` menjalankan `apt-get upgrade` terhadap semua paket APT yang memiliki pembaruan, bukan hanya PHP dan Node.js.** Pembaruan paket juga bisa me-restart service sebelum tahap restart terarah. Siapkan backup/snapshot dan maintenance window, lalu lakukan rollout bertahap.
+> Ini adalah operasi yang **mengubah sistem**. Jangan jalankan perintah upgrade satu baris dari kode yang belum ditinjau. Perhatikan bahwa APT sendiri dapat memicu restart service sebelum fase restart terarah. Tidak ada rollback otomatis.
+
+### Apa itu `healthchecks.tsv`?
+
+File `/etc/ubuntu-maintenance/healthchecks.tsv` berisi **daftar endpoint HTTP untuk memverifikasi aplikasi sebelum dan sesudah upgrade**. Ini bukan file bawaan Ubuntu dan harus Anda buat serta sesuaikan sendiri. Nama `.tsv` merupakan konvensi penamaan saja: **format yang diterima skrip saat ini menggunakan pemisah `|` (pipe), bukan karakter tab**.
+
+Setiap baris memiliki format:
+
+```text
+nama_aplikasi|URL_health|kode_HTTP_yang_diharapkan
+```
+
+Contoh isinya (ganti alamat/port sesuai aplikasi sebenarnya):
+
+```text
+api-public|http://127.0.0.1:3000/health|200
+webhook|http://127.0.0.1:3001/health|200
+```
+
+Untuk membuat file:
+
+```bash
+sudo install -d -m 700 /etc/ubuntu-maintenance
+sudo nano /etc/ubuntu-maintenance/healthchecks.tsv
+sudo chmod 600 /etc/ubuntu-maintenance/healthchecks.tsv
+```
+
+Salin dan ubah contoh isinya di editor. Pastikan setiap URL memang mengembalikan status HTTP sesuai yang diharapkan; contoh periksa sebelum upgrade:
+
+```bash
+curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3000/health
+```
+
+Jika responsnya `200`, contoh endpoint tersebut dapat digunakan. Jika aplikasi belum mempunyai endpoint `/health`, buat endpoint yang tepat atau gunakan URL lokal lain yang benar-benar mencerminkan kesehatan aplikasi. **PM2 `online` / systemd `active` tidak sama dengan aplikasi yang lulus health check.** Untuk worker tanpa HTTP endpoint, pemeriksaan health yang lebih spesifik masih memerlukan implementasi terpisah.
+
+Secara default `--apply` **ditolak** jika tidak ada endpoint valid yang terdaftar atau baseline health check gagal. Opsi `--allow-unverified` tersedia untuk melewati keharusan memiliki endpoint, tetapi tidak disarankan pada server produksi.
 
 ## Opsi CLI
 
