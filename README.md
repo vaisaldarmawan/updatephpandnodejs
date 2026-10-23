@@ -25,30 +25,62 @@
 
 ## Quick start
 
-### 1. Audit langsung dengan satu baris (tanpa upgrade)
+### 1. Download file `.sh` dari GitHub
+
+Gunakan **salah satu** perintah berikut. Perintah ini **hanya mengunduh file**, tidak menjalankan audit maupun upgrade.
+
+**Dengan `curl`:**
 
 ```bash
-curl -fsSLo /tmp/ubuntu-maintenance-v03.sh https://raw.githubusercontent.com/vaisaldarmawan/updatephpandnodejs/main/ubuntu-maintenance-v03.sh && bash /tmp/ubuntu-maintenance-v03.sh --audit
+curl -fL --retry 3 -o ubuntu-maintenance-v03.sh https://raw.githubusercontent.com/vaisaldarmawan/updatephpandnodejs/main/ubuntu-maintenance-v03.sh
+```
+
+**Atau dengan `wget`:**
+
+```bash
+wget -O ubuntu-maintenance-v03.sh https://raw.githubusercontent.com/vaisaldarmawan/updatephpandnodejs/main/ubuntu-maintenance-v03.sh
+```
+
+Berikan izin eksekusi (opsional jika menjalankannya dengan `bash`):
+
+```bash
+chmod +x ubuntu-maintenance-v03.sh
+```
+
+Sebaiknya **periksa isi file** sebelum menjalankannya sebagai root, misalnya dengan `less ubuntu-maintenance-v03.sh`.
+
+### 2. Audit server (tanpa upgrade)
+
+Jika skrip sudah diunduh di direktori saat ini:
+
+```bash
+bash ./ubuntu-maintenance-v03.sh --audit
 ```
 
 Untuk inventaris proses dan service yang lebih lengkap:
 
 ```bash
-sudo bash /tmp/ubuntu-maintenance-v03.sh --audit
+sudo bash ./ubuntu-maintenance-v03.sh --audit
+```
+
+**Alternatif satu baris — download lalu langsung audit (bukan upgrade):**
+
+```bash
+curl -fsSLo /tmp/ubuntu-maintenance-v03.sh https://raw.githubusercontent.com/vaisaldarmawan/updatephpandnodejs/main/ubuntu-maintenance-v03.sh && sudo bash /tmp/ubuntu-maintenance-v03.sh --audit
 ```
 
 > [!CAUTION]
-> Tautan `main` dapat berubah ketika repository diperbarui. Untuk produksi, **review isi skrip dan pin URL ke full commit SHA** yang telah Anda setujui sebelum menjalankannya sebagai root. Jangan menjalankan skrip jarak jauh dengan pola `curl | sudo bash` tanpa pemeriksaan.
+> URL `main` dapat berubah ketika repository diperbarui. Untuk produksi, **review isi skrip dan pin URL ke full commit SHA** yang telah Anda setujui sebelum menjalankannya sebagai root. Jangan menjalankan skrip jarak jauh dengan pola `curl | sudo bash` tanpa pemeriksaan.
 
-### 2. Lihat simulasi output
+### 3. Lihat simulasi output
 
 ```bash
-bash /tmp/ubuntu-maintenance-v03.sh --demo
+bash ./ubuntu-maintenance-v03.sh --demo
 ```
 
 Mode `--demo` menampilkan data **fiktif** dan tidak melakukan maintenance pada server.
 
-### 3. Konfigurasi health check sebelum upgrade
+### 4. Konfigurasi health check sebelum upgrade
 
 Buat file `/etc/ubuntu-maintenance/healthchecks.tsv` dengan format berikut (**pemisah `|`**, bukan tab):
 
@@ -71,10 +103,10 @@ Sesuaikan nama/port/endpoint dengan aplikasi Anda. Jangan memasukkan credential 
 
 > Status PM2 `online` atau systemd `active` hanya menunjukkan proses hidup; status aplikasi **belum terverifikasi sehat** apabila tidak ada health check yang relevan.
 
-### 4. Jalankan upgrade (server Ubuntu, root)
+### 5. Jalankan upgrade (server Ubuntu, root)
 
 ```bash
-sudo bash /tmp/ubuntu-maintenance-v03.sh --apply --health-file /etc/ubuntu-maintenance/healthchecks.tsv
+sudo bash ./ubuntu-maintenance-v03.sh --apply --health-file /etc/ubuntu-maintenance/healthchecks.tsv
 ```
 
 `--apply` memerlukan root dan secara default menolak upgrade bila tidak ada HTTP health check yang valid. Penggunaan `--allow-unverified` tersedia sebagai *override* berisiko; **tidak disarankan untuk produksi**.
@@ -103,19 +135,19 @@ sudo bash /tmp/ubuntu-maintenance-v03.sh --apply --health-file /etc/ubuntu-maint
 Audit tanpa permintaan ke layanan lookup IP publik:
 
 ```bash
-bash /tmp/ubuntu-maintenance-v03.sh --audit --no-public-ip
+bash ./ubuntu-maintenance-v03.sh --audit --no-public-ip
 ```
 
 Periksa disk pada mount point lain:
 
 ```bash
-sudo bash /tmp/ubuntu-maintenance-v03.sh --audit --disk-path /var
+sudo bash ./ubuntu-maintenance-v03.sh --audit --disk-path /var
 ```
 
 Upgrade APT sambil membiarkan restart ditangani operator:
 
 ```bash
-sudo bash /tmp/ubuntu-maintenance-v03.sh --apply --no-restart
+sudo bash ./ubuntu-maintenance-v03.sh --apply --no-restart
 ```
 
 **Catatan:** `--no-restart` tidak mencegah restart yang mungkin dilakukan oleh sistem paket Ubuntu sendiri.
@@ -187,7 +219,7 @@ Restart hanya dipertimbangkan ketika paket yang relevan benar-benar berubah dan 
 Contoh pengarsipan manual oleh operator:
 
 ```bash
-sudo bash /tmp/ubuntu-maintenance-v03.sh --audit 2>&1 | tee ubuntu-maintenance-audit.log
+sudo bash ./ubuntu-maintenance-v03.sh --audit 2>&1 | tee ubuntu-maintenance-audit.log
 ```
 
 ## Persyaratan
