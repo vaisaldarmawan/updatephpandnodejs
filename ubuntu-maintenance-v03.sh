@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-SCRIPT_VERSION='0.3.3'
+SCRIPT_VERSION='0.3.4'
 MODE='audit'
 ALLOW_CONTAINER=0
 UPDATE_NVM=0
@@ -32,7 +32,7 @@ NVM_PRESENT=0
 
 usage() {
 cat <<'HELP'
-Ubuntu Maintenance v0.3.3 — terminal-only (no report upload or saved logs)
+Ubuntu Maintenance v0.3.4 — terminal-only (no report upload or saved logs)
 
   bash ubuntu-maintenance-v03.sh --audit             # regular user or root
   sudo bash ubuntu-maintenance-v03.sh --audit        # fuller host inventory
@@ -63,7 +63,7 @@ HELP
 demo() {
 cat <<'DEMO'
 ╔════════════════════════════════════════════════════════════════════╗
-║  UBUNTU MAINTENANCE v0.3.3 • SIMULASI (BUKAN HASIL SERVER ASLI)   ║
+║  UBUNTU MAINTENANCE v0.3.4 • SIMULASI (BUKAN HASIL SERVER ASLI)   ║
 ╚════════════════════════════════════════════════════════════════════╝
 [15:08:21] Mode              : APPLY
 [15:08:21] Hostname          : prod-api-01
@@ -89,10 +89,8 @@ cat <<'DEMO'
 [15:08:23] ✓ baseline api.service aktif dan webhook PM2 online
 
 ──── [03] PEMBARUAN PAKET ────
-[15:08:25] ⠋ apt-get update ... (output APT tetap ditampilkan)
-[15:08:35] ✓ apt-get update berhasil
-[15:08:36] ⠙ apt-get upgrade ... (output APT tetap ditampilkan)
-[15:08:57] ✓ apt-get upgrade berhasil
+[15:08:25] Apt Update   [done]
+[15:08:36] Apt Upgrade  [done]
 
 ──── [04] RESTART TERARAH ────
 [15:08:58] ✓ php8.3-fpm.service : restart berhasil; active
@@ -460,15 +458,50 @@ show_runtime() {
   (( count>0 )) || log "$label: tidak ditemukan pada path host standar"
 }
 
-# Commands that produce useful live output; do not hide APT output.
-run_live() {
+# Quiet command runner for human-friendly terminal output.
+# Full machine output is captured temporarily and only summarized on failure.
+run_quiet() {
   local description=$1; shift
-  log "$description"
-  # No background command, so output stays in chronological order and visible.
-  # Spinner is on the left before each phase, while APT progress remains native.
-  if [[ -t 1 ]]; then printf '  ↻ %s (output langsung)\n' "$description"; fi
-  if "$@"; then ok "$description berhasil"; return 0
-  else err "$description gagal"; return 1; fi
+  local slug logfile rc lastline index=0
+  local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+  slug=$(printf '%s' "$description" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-')
+  logfile="$TMP/${slug:-step}.log"
+  : > "$logfile"
+
+  if [[ -t 1 ]]; then
+    printf '[%s] %s ' "$(date '+%H:%M:%S')" "$description"
+    "$@" >"$logfile" 2>&1 &
+    local pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+      printf '
+[%s] %s %s' "$(date '+%H:%M:%S')" "$description" "${frames[index%10]}"
+      index=$((index+1))
+      sleep 0.12
+    done
+    wait "$pid"; rc=$?
+    if (( rc == 0 )); then
+      printf '
+[%s] %-44s %b[done]%b\n' "$(date '+%H:%M:%S')" "$description" "$GREEN" "$RESET"
+      return 0
+    fi
+    printf '
+[%s] %-44s %b[failed]%b\n' "$(date '+%H:%M:%S')" "$description" "$RED" "$RESET"
+  else
+    if "$@" >"$logfile" 2>&1; then
+      printf '[%s] %-44s [done]\n' "$(date '+%H:%M:%S')" "$description"
+      return 0
+    fi
+    rc=$?
+    printf '[%s] %-44s [failed]\n' "$(date '+%H:%M:%S')" "$description"
+  fi
+
+  lastline=$(awk 'NF{line=$0} END{print line}' "$logfile" 2>/dev/null || true)
+  if [[ -n $lastline ]]; then
+    err "$description gagal: ${lastline:0:220}"
+  else
+    err "$description gagal tanpa pesan output."
+  fi
+  return $rc
 }
 
 section 'RUNTIME AWAL (PHP / NODE / NVM)'
@@ -510,7 +543,7 @@ if [[ $MODE == apply ]]; then
     err 'APT/dpkg lock sedang digunakan. Upgrade dibatalkan.'; APPLY_ABORTED=1
   fi
   if ((APPLY_ABORTED==0)); then
-    section 'APT UPDATE DAN UPGRADE (OUTPUT LANGSUNG)'
+    section 'APT UPDATE DAN UPGRADE'
     if [[ $CONTAINER == yes ]]; then warn 'Container APT mode enabled; no automatic service restarts in container'; fi
     if [[ -r /var/lib/dpkg/status ]]; then
       dpkg-query -W -f='${binary:Package}\t${Version}\n' > "$TMP/packages-before" 2>/dev/null || true
@@ -552,9 +585,9 @@ if [[ $MODE == apply ]]; then
       fi
       return 0
     }
-    if run_live 'apt-get update' env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none NEEDRESTART_MODE=l apt-get -o DPkg::Lock::Timeout=60 update; then
+    if run_quiet 'Apt Update' env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none NEEDRESTART_MODE=l apt-get -qq -o DPkg::Lock::Timeout=60 update; then
       if node_apt_major_check; then
-        if run_live 'apt-get upgrade (paket mungkin memicu restart sendiri)' env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none NEEDRESTART_MODE=l apt-get -o DPkg::Lock::Timeout=60 -o Dpkg::Options::=--force-confold -y upgrade; then
+        if run_quiet 'Apt Upgrade' env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none NEEDRESTART_MODE=l apt-get -qq -o DPkg::Lock::Timeout=60 -o Dpkg::Options::=--force-confold -y upgrade; then
           APT_RAN=1
         else
           APPLY_ABORTED=1
