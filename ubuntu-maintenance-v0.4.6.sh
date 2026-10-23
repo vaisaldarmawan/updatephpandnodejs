@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-SCRIPT_VERSION='0.4.5'
+SCRIPT_VERSION='0.4.6'
 MODE='audit'
 ALLOW_CONTAINER=0
 UPDATE_NVM=0
@@ -50,15 +50,17 @@ WEB_HEALTH_FAIL=0
 WEB_HEALTH_WARN=0
 WEB_PROBE_PASS=0
 WEB_PROBE_FAIL=0
+FORCE_UNMANAGED=0
+FORCE_UNMANAGED_COUNT=0
 
 usage() {
 cat <<'HELP'
-Ubuntu Maintenance v0.4.5 — terminal-only (no report upload or saved logs)
+Ubuntu Maintenance v0.4.6 — terminal-only (no report upload or saved logs)
 
-  bash ubuntu-maintenance-v0.4.5.sh --audit             # regular user or root
-  sudo bash ubuntu-maintenance-v0.4.5.sh --audit        # fuller host inventory
-  bash ubuntu-maintenance-v0.4.5.sh --demo              # simulated terminal view
-  sudo bash ubuntu-maintenance-v0.4.5.sh --apply        # stop managed apps, upgrade runtimes, start and verify
+  bash ubuntu-maintenance-v0.4.6.sh --audit             # regular user or root
+  sudo bash ubuntu-maintenance-v0.4.6.sh --audit        # fuller host inventory
+  bash ubuntu-maintenance-v0.4.6.sh --demo              # simulated terminal view
+  sudo bash ubuntu-maintenance-v0.4.6.sh --apply        # stop managed apps, upgrade runtimes, start and verify
 
 Options:
   --audit                 Read-only inventory (default), supports non-root/container
@@ -67,6 +69,10 @@ Options:
   --update-nvm            Update NVM default within its existing major (optional)
   --node-lts              Require a recognized NodeSource path to Node 24 LTS (strict mode)
   --no-restart            Skip automatic PHP/Node stop/start and local web-server restart
+  --force-restart-unmanaged
+                         Force stop/start standalone Node processes using original
+                         user, argv, cwd and environment; may detach Screen/Tmux
+                         sessions; use only with approved downtime and backup.
   --no-public-ip          Never contact an external IP lookup endpoint
   --check-url URL         Check an HTTP(S) endpoint before/after (repeatable)
                          Example: --check-url http://10.0.0.126:3000/
@@ -78,7 +84,8 @@ Important:
 * APT updates installed Ubuntu-managed PHP/Node packages, NOT NVM/asdf/fnm,
   Docker images, or binaries installed manually. PHP 8.5 requires an existing compatible APT repository; the script never silently adds a PPA.
 * Root manages PM2 as each owning user with its own HOME/PM2_HOME (not the root PM2 list). PM2 installations with custom PM2_HOME need manual handling.
-* Managed PHP/Node systemd services and online PM2 apps are stopped before changing packages and started afterward, including recovery attempts on failure. Local active Nginx/Apache is restarted after apps start, if its configuration test passes. An unsupervised process (screen/tmux/nohup) cannot be safely restarted automatically without its original startup configuration.
+* Managed PHP/Node systemd services and online PM2 apps are stopped before changing packages and started afterward, including recovery attempts on failure. Local active Nginx/Apache is restarted after apps start, if its configuration test passes.
+* --force-restart-unmanaged (explicit opt-in) captures startup argv/cwd/env for standalone Node apps, terminates them and starts detached copies as the original user. This CHANGES Screen/Tmux behavior and redirects future stdout/stderr to /dev/null; interactive apps, dynamic startup wrappers and nonpersistent dependencies can fail. If metadata cannot be captured, the script aborts before stopping any app. Prefer systemd/PM2 for production.
 * A process with /proc/PID/exe marked (deleted), or an executable inode different from the current binary, is reported STALE on every run (audit and apply), including when APT changed no packages.
 * PHP 8.5 CLI migration runs only for CLI-only installs with matching modules; existing PHP-FPM virtual hosts are never automatically rewired. Latest PHP major may remain pending on FPM-backed sites.
 * Apply needs no configuration file; HTTP GET is checked on identified local TCP ports and optional --check-url values. HTTP response checks do not guarantee database/queue functionality. During the stop→start window, monitored applications may be unavailable.
@@ -91,7 +98,7 @@ HELP
 demo() {
 cat <<'DEMO'
 ╔════════════════════════════════════════════════════════════════════╗
-║  UBUNTU MAINTENANCE v0.4.5 • SIMULASI (BUKAN HASIL SERVER ASLI)   ║
+║  UBUNTU MAINTENANCE v0.4.6 • SIMULASI (BUKAN HASIL SERVER ASLI)   ║
 ╚════════════════════════════════════════════════════════════════════╝
 [15:08:21] Mode              : APPLY
 [15:08:21] Hostname          : prod-api-01
@@ -117,13 +124,14 @@ cat <<'DEMO'
 [15:08:23] ✓ baseline api.service aktif dan webhook PM2 online
 
 ──── [03] WEB / PORT AKTIF ────
-[15:08:23] ✓ Web node:api: http://127.0.0.1:3000/ [HTTP 200]
+[15:08:23] ✓ Web node:api: http://192.168.10.20:3000/ [HTTP 200]
 [15:08:23] ✓ Web custom (--check-url): http://10.0.0.126:3000/ [HTTP 200]
 
 ──── [04] STOP SERVICE (YANG SEBELUMNYA AKTIF) ────
 [15:08:24] Stop php8.5-fpm.service   [done]
 [15:08:25] Stop api.service          [done]
 [15:08:26] Stop PM2 deploy/webhook   [done]
+[15:08:27] Stop Node deploy/admin    [done] (opsional: --force-restart-unmanaged)
 
 ──── [05] UPGRADE RUNTIME & PAKET ────
 [15:08:30] Apt Update               [done]
@@ -135,6 +143,7 @@ cat <<'DEMO'
 [15:09:03] Start php8.5-fpm.service  [done]
 [15:09:05] Start api.service         [done]
 [15:09:08] Start PM2 deploy/webhook  [done]
+[15:09:09] Start Node deploy/admin   [done] (opsional)
 [15:09:09] Restart nginx.service    [done]
 [15:09:10] Verifikasi proses        [done]
 
@@ -161,6 +170,7 @@ while (( $# > 0 )); do
     --update-nvm) UPDATE_NVM=1 ;;
     --node-lts) NODE_LTS=1; AUTO_LTS=0 ;;
     --no-restart) RESTART=0 ;;
+    --force-restart-unmanaged) FORCE_UNMANAGED=1 ;;
     --no-public-ip) PUBLIC_IP_LOOKUP=0 ;;
     --check-url)
       (( $# >= 2 )) || { printf 'Missing URL after --check-url\n' >&2; exit 64; }
@@ -181,6 +191,10 @@ for weburl in "${CHECK_URLS[@]}"; do
     exit 64
   fi
 done
+if ((FORCE_UNMANAGED)) && { [[ $MODE != apply ]] || ((RESTART==0)); }; then
+  printf '%s\n' '--force-restart-unmanaged requires --apply without --no-restart' >&2
+  exit 64
+fi
 if ((NODE_LTS)) && [[ $MODE != apply ]]; then
   printf '%s\n' '--node-lts requires --apply' >&2
   exit 64
@@ -229,6 +243,10 @@ elif command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt --qui
   CONTAINER='yes'
 elif [[ -r /proc/1/cgroup ]] && grep -Eiq '(docker|kubepods|containerd|podman|lxc)' /proc/1/cgroup; then
   CONTAINER='yes'
+fi
+if ((FORCE_UNMANAGED)) && [[ $CONTAINER == yes ]]; then
+  err '--force-restart-unmanaged tidak didukung di dalam container; gunakan orchestrator.'
+  exit 2
 fi
 if [[ $MODE == apply ]]; then
   if (( EUID != 0 )); then err 'Apply requires root. Run with sudo, or use --audit.'; exit 77; fi
@@ -416,9 +434,34 @@ nvm_snapshot() {
 # Process runtime checks never invoke the application or print its arguments.
 # Compare the executable inode (device + inode), not just the path or APT delta.
 # A running process can keep an unlinked Node ELF in memory after upgrades.
-node_exe() { readlink "/proc/$1/exe" 2>/dev/null || true; }
+proc_user() {
+  local uid
+  uid=$(stat -c %u "/proc/$1" 2>/dev/null || true)
+  [[ $uid =~ ^[0-9]+$ ]] || return 1
+  getent passwd "$uid" | cut -d: -f1
+}
+node_exe() {
+  local pid=$1 result owner
+  result=$(readlink "/proc/$pid/exe" 2>/dev/null || true)
+  if [[ -z $result && $EUID -eq 0 ]]; then
+    owner=$(proc_user "$pid" || true)
+    if [[ -n $owner ]]; then
+      result=$(runuser -u "$owner" -- readlink "/proc/$pid/exe" 2>/dev/null || true)
+    fi
+  fi
+  printf '%s' "$result"
+}
+node_cwd() {
+  local pid=$1 result owner
+  result=$(readlink "/proc/$pid/cwd" 2>/dev/null || true)
+  if [[ -z $result && $EUID -eq 0 ]]; then
+    owner=$(proc_user "$pid" || true)
+    if [[ -n $owner ]]; then result=$(runuser -u "$owner" -- readlink "/proc/$pid/cwd" 2>/dev/null || true); fi
+  fi
+  printf '%s' "$result"
+}
 node_runtime_state() {
-  local pid=$1 exe path process_inode current_inode
+  local pid=$1 exe path process_inode current_inode owner
   [[ $pid =~ ^[0-9]+$ && -L /proc/$pid/exe ]] || { printf 'missing'; return 0; }
   exe=$(node_exe "$pid")
   [[ -n $exe ]] || { printf 'unknown'; return 0; }
@@ -426,6 +469,10 @@ node_runtime_state() {
   path=$exe
   [[ -e $path ]] || { printf 'stale'; return 0; }
   process_inode=$(stat -Lc '%d:%i' "/proc/$pid/exe" 2>/dev/null || true)
+  if [[ -z $process_inode && $EUID -eq 0 ]]; then
+    owner=$(proc_user "$pid" || true)
+    if [[ -n $owner ]]; then process_inode=$(runuser -u "$owner" -- stat -Lc '%d:%i' "/proc/$pid/exe" 2>/dev/null || true); fi
+  fi
   current_inode=$(stat -Lc '%d:%i' "$path" 2>/dev/null || true)
   if [[ -z $process_inode || -z $current_inode ]]; then
     printf 'unknown'
@@ -464,7 +511,7 @@ node_proc_inventory() {
     case "$cmd" in node|nodejs|npm) ;; *) continue;; esac
     exe=$(node_exe "$pid")
     unit=$(service_for_pid "$pid")
-    cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null || true)
+    cwd=$(node_cwd "$pid")
     if [[ -n $unit ]]; then
       desc=$unit; state="$(systemctl is-active "$unit" 2>/dev/null || echo unknown)"
       printf 'systemd|%s|%s|%s|%s|%s\n' "$user" "$desc" "$state" "$pid" "$exe" >> "$target"
@@ -657,10 +704,15 @@ web_discover() {
   : > "$TMP/web-endpoints"
   if command -v ss >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
     ss -H -ltnp > "$source_file" 2>/dev/null || true
-    python3 - "$source_file" "$TMP/node-apps-before" "$TMP/web-endpoints" <<'PYWEB'
-import re, sys
+    python3 - "$source_file" "$TMP/node-apps-before" "$TMP/web-endpoints" "$LOCAL_IP" <<'PYWEB'
+import re, sys, ipaddress
 from pathlib import Path
-socket_file, app_file, out_file = map(Path, sys.argv[1:])
+socket_file, app_file, out_file = map(Path, sys.argv[1:4])
+local_ip = sys.argv[4]
+try:
+    ipaddress.IPv4Address(local_ip)
+except ValueError:
+    local_ip = ''
 node_by_pid = {}
 for line in app_file.read_text(errors='replace').splitlines():
     parts = line.split('|')
@@ -671,41 +723,39 @@ for line in socket_file.read_text(errors='replace').splitlines():
     fields = line.split()
     if len(fields) < 4:
         continue
-    listen_address = fields[3]
-    m = re.search(r':(\d+)$', listen_address)
-    if not m:
+    address = fields[3]
+    m = re.search(r':(\d+)$', address)
+    if not m or not local_ip:
         continue
     port = int(m.group(1))
-    if port < 1 or port > 65535:
+    if not (0 < port <= 65535):
         continue
     pids = re.findall(r'pid=(\d+)', line)
     procnames = re.findall(r'"([^"\\]+)"\s*,\s*pid=', line)
     nodepid = next((pid for pid in pids if pid in node_by_pid), '')
-    known_type = ('node' if nodepid else
-                  'nginx' if any(x.startswith('nginx') for x in procnames) else
-                  'apache' if any(x in ('apache2','httpd') for x in procnames) else
-                  'php' if any(x.startswith('php-fpm') or x.startswith('php') for x in procnames) else '')
-    if not known_type:
+    kind = ('node' if nodepid else
+            'nginx' if any(x.startswith('nginx') for x in procnames) else
+            'apache' if any(x in ('apache2','httpd') for x in procnames) else
+            'php' if any(x.startswith('php-fpm') or x.startswith('php') for x in procnames) else '')
+    if not kind:
         continue
-    if known_type in ('nginx','apache') and port not in (80,443,8080,8443):
+    if kind in ('nginx', 'apache') and port not in (80, 443, 8080, 8443):
         continue
-    addr = listen_address[:m.start()]
-    # Local connectivity uses loopback only for wildcard bind addresses.
-    if addr in ('0.0.0.0','*','127.0.0.1'):
-        host = '127.0.0.1'
-    elif addr in ('[::]','::','[::1]','::1'):
-        host = '[::1]'
-    else:
-        host = addr
-    scheme = 'https' if port in (443,8443) else 'http'
-    url = f'{scheme}://{host}:{port}/'
-    key=(known_type, url)
+    bound = address[:m.start()].strip('[]')
+    # Never claim a localhost-only listener is reachable through the LAN IP.
+    if bound in ('127.0.0.1', '::1', 'localhost') or bound.startswith('127.'):
+        continue
+    if bound not in ('0.0.0.0', '*', '::', local_ip):
+        continue
+    label = (f'node:{node_by_pid[nodepid]}' if nodepid else kind)
+    label = label.replace('|','/').replace('\n',' ')[:70]
+    key = (kind, port, label)
     if key in seen:
         continue
     seen.add(key)
-    label = (f'node:{node_by_pid[nodepid]}' if nodepid else known_type)
-    label = label.replace('|','/').replace('\n',' ')[:70]
-    items.append(f'auto|{label}|{url}|{listen_address}|{port}')
+    scheme = 'https' if port in (443, 8443) else 'http'
+    url = f'{scheme}://{local_ip}:{port}/'
+    items.append(f'auto|{label}|{url}|{address}|{port}')
 with out_file.open('a') as out:
     for item in items[:20]:
         out.write(item+'\n')
@@ -731,7 +781,11 @@ web_probe() {
     [[ $phase == AFTER && $MODE == apply ]] && tries=3
     for ((attempt=1;attempt<=tries;attempt++)); do
       if command -v curl >/dev/null 2>&1; then
-        if code=$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 4 --max-redirs 0 "$url" 2>/dev/null); then
+        # IP-based HTTPS availability probe: ignore cert name mismatch.
+        # It does not validate certificate trust.
+        local -a tls_opts=()
+        if [[ $source == auto && $url == https://* ]]; then tls_opts=(-k); fi
+        if code=$(curl --noproxy '*' "${tls_opts[@]}" -sS -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 4 --max-redirs 0 "$url" 2>/dev/null); then
           rc=0
           [[ $code =~ ^[0-9]{3}$ ]] || code=000
         else
@@ -886,12 +940,172 @@ restart_local_web() {
 }
 
 
-# Snapshot-driven lifecycle. Never stop bare process/screen/tmux workloads:
-# their startup commands and environment cannot be faithfully reconstructed.
+# The helper runs only as root, preserves the process owner and original
+# cwd/arguments/environment (stored in private temporary JSON), and refuses to
+# stop processes if the startup information cannot be reconstructed.
+# A forced unmanaged restart is explicitly opted into; it is NOT a replacement
+# for a persistent systemd/PM2 service.
+cat > "$TMP/restart-standalone.py" <<'PYRESTART'
+import json, os, pwd, signal, subprocess, sys, time
+from pathlib import Path
+
+
+def fail(message):
+    print('ERROR: ' + message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def stat_info(pid):
+    try:
+        data = Path(f'/proc/{pid}/stat').read_text()
+        rest = data[data.rfind(')')+2:].split()
+        return rest[19], rest[0]  # starttime, state
+    except (OSError, ValueError, IndexError):
+        return None, None
+
+
+def capture(pid, out):
+    if pid < 2:
+        fail('PID tidak valid')
+    proc = Path(f'/proc/{pid}')
+    try:
+        uid = proc.stat().st_uid
+        pw = pwd.getpwuid(uid)
+        comm = (proc / 'comm').read_text().strip()
+        try:
+            exe = os.readlink(proc / 'exe').removesuffix(' (deleted)')
+            cwd = os.readlink(proc / 'cwd')
+            argv_raw = (proc/'cmdline').read_bytes()
+            environ_raw = (proc/'environ').read_bytes()
+        except PermissionError:
+            # Some kernels deny even root /proc/*/environ when CAP_SYS_PTRACE
+            # is unavailable. The process owner may still inspect itself.
+            read_as_owner = r"""
+import json,os,sys
+from pathlib import Path
+p=Path('/proc')/sys.argv[1]
+x={'exe':os.readlink(p/'exe'),'cwd':os.readlink(p/'cwd'),
+   'argv':(p/'cmdline').read_bytes().decode('utf-8','surrogateescape'),
+   'env':(p/'environ').read_bytes().decode('utf-8','surrogateescape')}
+print(json.dumps(x,ensure_ascii=True))
+"""
+            output=subprocess.check_output(
+                ['runuser','-u',pw.pw_name,'--','python3','-c',read_as_owner,str(pid)],
+                stderr=subprocess.DEVNULL, timeout=6)
+            info=json.loads(output)
+            exe=info['exe'].removesuffix(' (deleted)')
+            cwd=info['cwd']
+            argv_raw=info['argv'].encode('utf-8','surrogateescape')
+            environ_raw=info['env'].encode('utf-8','surrogateescape')
+        argv = [x.decode('utf-8', 'surrogateescape') for x in argv_raw.split(b'\0') if x]
+        environ = {}
+        for part in environ_raw.split(b'\0'):
+            if b'=' in part:
+                k,v=part.split(b'=',1)
+                environ[k.decode('utf-8','surrogateescape')]=v.decode('utf-8','surrogateescape')
+        start, state = stat_info(pid)
+    except (OSError, KeyError, subprocess.SubprocessError, ValueError) as e:
+        fail(f'gagal membaca metadata PID {pid}: {e.__class__.__name__}')
+    if comm not in ('node','nodejs','npm') or not argv or not start:
+        fail(f'PID {pid} tidak memiliki metadata proses Node yang valid')
+    if not os.path.isdir(cwd) or not os.access(exe, os.X_OK):
+        fail(f'direktori kerja atau executable Node tidak tersedia untuk PID {pid}')
+    if not os.path.isfile(exe):
+        fail('Node executable tidak ditemukan')
+    if not Path('/usr/bin/node').exists() or exe != '/usr/bin/node':
+        fail(f'Node bukan executable APT /usr/bin/node ({exe}); restart otomatis ditolak')
+    if any('\0' in x for x in argv) or not environ:
+        fail('argumen atau environment asli tidak valid')
+    spec=dict(pid=pid, uid=uid, gid=pw.pw_gid, user=pw.pw_name,
+              exe=exe, argv=argv, cwd=cwd, env=environ, start=start)
+    with open(out, 'w') as f:
+        json.dump(spec, f, ensure_ascii=True)
+    os.chmod(out, 0o600)
+    print(f'Prepared user={pw.pw_name} PID={pid} cwd={cwd}')
+
+
+def load(path):
+    with open(path) as f:
+        return json.load(f)
+
+
+def stop(path):
+    spec=load(path)
+    pid=spec['pid']; start,state=stat_info(pid)
+    if start != spec['start']:
+        fail(f'PID {pid} berubah sejak snapshot; tidak dihentikan')
+    os.kill(pid, signal.SIGTERM)
+    for _ in range(60):
+        start,state=stat_info(pid)
+        if start != spec['start'] or state in ('Z','X'):
+            print(f'Stopped PID={pid} (SIGTERM)'); return
+        time.sleep(0.1)
+    start,state=stat_info(pid)
+    if start == spec['start'] and state not in ('Z','X'):
+        os.kill(pid, signal.SIGKILL)
+    for _ in range(30):
+        start,state=stat_info(pid)
+        if start != spec['start'] or state in ('Z','X'):
+            print(f'Stopped PID={pid} (forced)'); return
+        time.sleep(0.1)
+    fail(f'PID {pid} belum berhenti setelah SIGKILL')
+
+
+def start(path):
+    spec=load(path)
+    if not os.path.isdir(spec['cwd']) or not os.access(spec['exe'], os.X_OK):
+        fail('cwd atau binary Node tidak tersedia setelah upgrade')
+    if stat_info(spec['pid'])[0] == spec['start'] and stat_info(spec['pid'])[1] not in ('Z','X'):
+        fail('proses lama masih hidup; tidak membuat duplikat')
+    pw=pwd.getpwuid(spec['uid'])
+    def drop():
+        if os.geteuid() == 0:
+            os.initgroups(pw.pw_name, pw.pw_gid)
+            os.setgid(pw.pw_gid)
+            os.setuid(pw.pw_uid)
+    try:
+        with open(os.devnull, 'rb') as stdin, open(os.devnull, 'ab') as stdout:
+            child=subprocess.Popen(spec['argv'], executable=spec['exe'],
+                cwd=spec['cwd'], env=spec['env'], start_new_session=True,
+                stdin=stdin, stdout=stdout, stderr=subprocess.STDOUT,
+                close_fds=True, preexec_fn=drop)
+        time.sleep(1.25)
+        if child.poll() is not None:
+            fail(f'Node process baru exit cepat (code {child.returncode}); periksa kompatibilitas aplikasi')
+        try:
+            exe=os.readlink(f'/proc/{child.pid}/exe')
+            exe_inode=os.stat(f'/proc/{child.pid}/exe').st_ino
+        except PermissionError:
+            inspect = "import os,sys; p='/proc/'+sys.argv[1]+'/exe'; print(os.readlink(p)); print(os.stat(p).st_ino)"
+            lines=subprocess.check_output(['runuser','-u',pw.pw_name,'--','python3','-c',inspect,str(child.pid)],
+                                          stderr=subprocess.DEVNULL, timeout=5).decode().splitlines()
+            exe,exe_inode=lines[0],int(lines[1])
+        if exe.endswith(' (deleted)') or exe_inode != os.stat(spec['exe']).st_ino:
+            fail('proses baru masih menggunakan binary Node lama')
+        print(f'Started user={pw.pw_name} PID={child.pid} with current Node')
+    except (OSError, subprocess.SubprocessError) as e:
+        fail(f'proses tidak dapat dijalankan ulang: {e.__class__.__name__}: {e}')
+
+
+if __name__ == '__main__':
+    if len(sys.argv) != 4 or sys.argv[1] not in ('capture','stop','start'):
+        fail('expected capture|stop|start PID|spec-file spec-file')
+    if sys.argv[1] == 'capture':
+        capture(int(sys.argv[2]), sys.argv[3])
+    elif sys.argv[1] == 'stop':
+        stop(sys.argv[3])
+    else:
+        start(sys.argv[3])
+PYRESTART
+
+# Snapshot-driven lifecycle. Services managed by systemd/PM2 use their original
+# supervisors. Standalone Node is changed only with explicit force opt-in.
 : > "$TMP/stopped-services"
 : > "$TMP/stopped-pm2"
 : > "$TMP/stop-plan-services"
 : > "$TMP/stop-plan-pm2"
+: > "$TMP/stopped-unmanaged"
+: > "$TMP/force-prepared"
 
 pm2_run_as() {
   local user=$1 home=$2 bin=$3; shift 3
@@ -944,10 +1158,28 @@ managed_stop_plan() {
 }
 
 stop_managed() {
-  local unit user name id bin home
+  local unit user name id bin home spec mgr status pid exe
   (( RESTART == 1 )) && [[ $CONTAINER == no ]] || return 0
   section 'STOP SERVICE PHP/NODE SEBELUM UPGRADE'
   if ! managed_stop_plan; then return 1; fi
+  if ((FORCE_UNMANAGED)); then
+    command -v python3 >/dev/null 2>&1 || { err 'Python3 wajib untuk --force-restart-unmanaged'; return 1; }
+    : > "$TMP/force-prepared"
+    while IFS='|' read -r mgr user name status pid exe; do
+      [[ $mgr == process && $pid =~ ^[0-9]+$ ]] || continue
+      if [[ -s $TMP/pm2-before ]] && awk -F '|' -v p="$pid" '$4==p {f=1} END{exit !f}' "$TMP/pm2-before"; then continue; fi
+      spec="$TMP/standalone-$pid.json"
+      if python3 "$TMP/restart-standalone.py" capture "$pid" "$spec" > "$TMP/capture-$pid.log" 2>&1; then
+        printf '%s|%s|%s|%s\n' "$user" "$name" "$pid" "$spec" >> "$TMP/force-prepared"
+      else
+        err "Restart paksa $user/$name PID=$pid tidak aman: $(tail -n 1 "$TMP/capture-$pid.log")"
+        return 1
+      fi
+    done < "$TMP/node-apps-before"
+    if [[ -s $TMP/force-prepared ]]; then
+      warn 'Force restart proses mandiri: aplikasi akan dilepas dari Screen/Tmux; stdout/stderr dialihkan ke /dev/null.'
+    fi
+  fi
   STOP_PHASE_ENTERED=1
   while IFS= read -r unit; do
     [[ -n $unit ]] || continue
@@ -969,20 +1201,32 @@ stop_managed() {
       return 1
     fi
   done < "$TMP/stop-plan-pm2"
-  if [[ ! -s $TMP/stopped-services && ! -s $TMP/stopped-pm2 ]]; then
+  if ((FORCE_UNMANAGED)); then
+    while IFS='|' read -r user name pid spec; do
+      [[ -n $pid ]] || continue
+      # Add to recovery list BEFORE sending signals.
+      printf '%s|%s|%s|%s\n' "$user" "$name" "$pid" "$spec" >> "$TMP/stopped-unmanaged"
+      if ! run_quiet "Stop Node $user/$name PID=$pid" python3 "$TMP/restart-standalone.py" stop unused "$spec"; then
+        err "Gagal stop $user/$name; recovery start akan dicoba bila proses sudah berhenti."
+        return 1
+      fi
+    done < "$TMP/force-prepared"
+  fi
+  if [[ ! -s $TMP/stopped-services && ! -s $TMP/stopped-pm2 && ! -s $TMP/stopped-unmanaged ]]; then
     log 'Tidak ada PHP/Node service terkelola yang perlu dihentikan.'
   fi
   # Unsupervised runtime processes cannot be restarted reliably.
   while IFS='|' read -r mgr user name status pid exe; do
     [[ $mgr == process ]] || continue
     if awk -F '|' -v p="$pid" '$4==p {f=1} END{exit !f}' "$TMP/pm2-before"; then continue; fi
-    warn "Proses mandiri $user/$name (PID $pid) tidak dihentikan: perintah untuk menyalakannya kembali tidak diketahui."
+    if ((FORCE_UNMANAGED)); then continue; fi
+    warn "Proses mandiri $user/$name (PID $pid) tidak dihentikan: jalankan --force-restart-unmanaged untuk percobaan restart paksa."
   done < "$TMP/node-apps-before"
   return 0
 }
 
 bring_back_managed() {
-  local unit user name id bin home failure=0
+  local unit user name id bin home pid spec failure=0
   # This function is also invoked by EXIT recovery. Do not defer starts on APT errors.
   while IFS= read -r unit; do
     [[ -n $unit ]] || continue
@@ -1004,6 +1248,20 @@ bring_back_managed() {
       failure=1
     fi
   done < "$TMP/stopped-pm2"
+  if [[ -s $TMP/stopped-unmanaged ]]; then
+    while IFS='|' read -r user name pid spec; do
+      [[ -n $pid ]] || continue
+      if run_quiet "Start Node $user/$name" python3 "$TMP/restart-standalone.py" start unused "$spec"; then
+        restart_record "process:$user/$name" OK relaunched
+        FORCE_UNMANAGED_COUNT=$((FORCE_UNMANAGED_COUNT+1))
+      else
+        err "Node $user/$name tidak dapat dijalankan ulang! Kunjungi aplikasi untuk recovery manual."
+        restart_record "process:$user/$name" FAIL start
+        failure=1
+      fi
+    done < "$TMP/stopped-unmanaged"
+    : > "$TMP/stopped-unmanaged"
+  fi
   START_PHASE_DONE=1
   if ((failure)); then RESTART_FAILED=1; return 1; fi
   return 0
@@ -1034,8 +1292,8 @@ prepare_nodesource_lts() {
     if [[ -s $TMP/pm2-before ]] && awk -F '|' -v p="$pid" '$4==p {f=1} END{exit !f}' "$TMP/pm2-before"; then continue; fi
     UNMANAGED_NODE_UPGRADE=1
   done < "$TMP/node-apps-before"
-  if (( UNMANAGED_NODE_UPGRADE )); then
-    warn 'Ada proses Node tanpa supervisor: runtime paket tetap akan di-upgrade, tetapi aplikasi tersebut perlu restart manual.'
+  if (( UNMANAGED_NODE_UPGRADE )) && (( !FORCE_UNMANAGED )); then
+    warn 'Ada proses Node tanpa supervisor: runtime paket tetap di-upgrade tetapi proses memerlukan restart manual.'
   fi
   for file in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
     [[ -f $file ]] || continue
