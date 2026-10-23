@@ -1,39 +1,56 @@
 # Ubuntu PHP & Node.js Maintenance
 
-Skrip Bash untuk audit server Ubuntu, upgrade runtime PHP/Node.js yang **sudah terpasang**, serta stop/start service terkelola dengan laporan langsung di terminal. Tanpa `healthchecks.tsv`, collector, atau upload data.
+Script Bash untuk audit Ubuntu, upgrade PHP/Node.js **yang sudah terpasang**, stop/start layanan terkelola, dan cek URL/port web sebelum-sesudah maintenance. Semua hasil di terminal, **tanpa upload laporan** dan tanpa `healthchecks.tsv`.
 
-**Versi: v0.4.2**
+**Versi: v0.4.5**
 
 ## Cara menggunakan
 
 ### 1. Download
 
 ```bash
-curl -fL --retry 3 -o ubuntu-maintenance-v0.4.2.sh https://raw.githubusercontent.com/vaisaldarmawan/updatephpandnodejs/main/ubuntu-maintenance-v0.4.2.sh
+curl -fL --retry 3 -o ubuntu-maintenance-v0.4.5.sh https://raw.githubusercontent.com/vaisaldarmawan/updatephpandnodejs/main/ubuntu-maintenance-v0.4.5.sh
 ```
 
 ### 2. Audit
 
 ```bash
-sudo bash ubuntu-maintenance-v0.4.2.sh --audit
+sudo bash ubuntu-maintenance-v0.4.5.sh --audit
 ```
 
-Membaca versi PHP/Node.js, aplikasi yang memakai runtime tersebut, status systemd/PM2, hostname, username, IP, CPU, RAM, dan disk. Tidak mengubah sistem.
+Memeriksa versi runtime, aplikasi Node/PHP, proses yang menggunakan executable lama (`(deleted)`), PM2/systemd, CPU, RAM, disk, IP, serta port TCP web yang dapat dikenali. Audit tidak mengubah paket atau me-restart service.
 
 ### 3. Apply
 
 ```bash
-sudo bash ubuntu-maintenance-v0.4.2.sh --apply
+sudo bash ubuntu-maintenance-v0.4.5.sh --apply
 ```
 
-Urutan: **deteksi versi → inventaris service → stop PHP-FPM/Node systemd/PM2 yang sebelumnya aktif → pembaruan APT dan runtime → start service yang dihentikan → verifikasi status dan laporan**. Jika upgrade gagal, skrip tetap mencoba menghidupkan kembali service yang telah dihentikan.
+Root akan mengelola PM2 milik masing-masing pengguna (misalnya `mpm`) dengan identitas pengguna dan `PM2_HOME` miliknya, bukan PM2 root. Instalasi PM2 dengan lokasi data nonstandar mungkin tidak terdeteksi.
 
-- **Node.js:** instalasi NodeSource APT yang dikenali dimigrasikan ke **24.x LTS** (versi patch terbaru yang tersedia di repo), lalu diperiksa kembali. Instalasi NVM/asdf/fnm dan image container tidak otomatis dipindahkan ke major terbaru.
-- **PHP:** update paket APT yang terpasang. Migrasi PHP CLI ke **8.5.x** dicoba apabila paket dan ekstensi cocok di repositori yang tersedia. Situs PHP-FPM/Apache **tidak dipindahkan otomatis ke socket/pool PHP baru**; jika target belum tercapai, laporan menampilkan `FAIL`/`REVIEW`. Skrip tidak menambahkan PPA pihak ketiga secara diam-diam.
-- **Service:** hanya service systemd PHP/Node dan aplikasi PM2 **yang sebelumnya aktif** yang dihentikan dan dihidupkan kembali. Aplikasi proses mandiri (`screen`, `tmux`, `nohup`) **tidak dihentikan otomatis** karena skrip tidak memiliki cara yang andal untuk menghidupkannya kembali. Untuk server seperti `bot-gabungan`, `admin-panel` perlu dikelola systemd/PM2 atau direstart manual setelah upgrade runtime.
-- **Pemeriksaan:** status proses `active/online` saja tidak menjamin endpoint API, database, dan queue berfungsi dengan benar.
+Urutannya: **inventaris → cek URL sebelum upgrade → stop PHP-FPM/Node systemd/PM2 terkelola → upgrade paket/runtime → start kembali → restart Nginx/Apache lokal yang semula aktif → cek runtime, service, URL/port → ringkasan**.
+
+### Opsional: cek URL web tertentu
+
+Jika ingin memastikan alamat web tertentu—misalnya aplikasi yang berada di server lain—tambahkan `--check-url`:
+
+```bash
+sudo bash ubuntu-maintenance-v0.4.5.sh --audit --check-url http://10.0.0.126:3000/
+```
+
+Atau saat upgrade:
+
+```bash
+sudo bash ubuntu-maintenance-v0.4.5.sh --apply --check-url http://10.0.0.126:3000/
+```
+
+Opsi `--check-url` dapat diulang untuk beberapa URL, termasuk `https://`. Tidak ada file konfigurasi tambahan. Script juga berusaha mendeteksi port Node/PHP/Nginx/Apache yang `LISTEN` menggunakan `ss` (sejauh informasi PID dapat dibaca). **Web server di IP lain tidak direstart dari skrip ini**. **IP server lain tidak otomatis dipindai**; gunakan `--check-url` untuk URL eksternal.
+
+**Arti pemeriksaan:** HTTP 2xx/3xx = endpoint merespons; HTTP 401/403 = endpoint dapat diakses tetapi memerlukan autentikasi; HTTP 4xx/5xx atau koneksi gagal = perlu investigasi. Respons HTTP belum membuktikan database, worker, atau seluruh fitur aplikasi normal. URL yang sebelumnya merespons tetapi menjadi gagal setelah upgrade akan menyebabkan hasil `FAIL`. Proses dengan binary `(deleted)` akan ditandai `STALE` meskipun URL masih merespons.
 
 > [!WARNING]
-> `--apply` menyebabkan **downtime** pada layanan yang dihentikan dan memperbarui **seluruh paket APT**, bukan hanya PHP/Node.js. Simpan snapshot/backup, gunakan maintenance window dan uji terlebih dahulu pada server canary. Upgrade mayor dapat merusak kompatibilitas aplikasi. Tidak tersedia rollback paket otomatis maupun reboot otomatis.
+> Mode `--apply` memperbarui seluruh paket APT, selain upaya upgrade PHP/Node yang didukung. Upgrade mayor dapat menyebabkan downtime dan ketidakcocokan aplikasi. Simpan snapshot/backup dan uji di server nonproduksi terlebih dahulu. Proses mandiri (misalnya Node di GNU Screen/Tmux) **tidak dihentikan secara paksa**, sebab perintah startup aslinya tidak selalu dapat dipulihkan. Aplikasi seperti itu mungkin perlu restart manual atau dipindah ke systemd/PM2. Skrip tidak membuat rollback otomatis dan tidak me-reboot server.
 
-**Repository:** [vaisaldarmawan/updatephpandnodejs](https://github.com/vaisaldarmawan/updatephpandnodejs)
+[Repository GitHub](https://github.com/vaisaldarmawan/updatephpandnodejs)
+
+**Catatan restart:** Nginx/Apache lokal yang tadinya aktif akan di-restart setelah proses aplikasi terkelola hidup kembali, walaupun paket Nginx/Apache tidak berubah. Konfigurasi diuji sebelum upgrade dan sebelum restart. `--no-restart` menonaktifkan tindakan tersebut. Proses Node yang berjalan di Screen/Tmux tanpa manajer tetap hanya ditandai `STALE`; skrip tidak mengirim `kill` tanpa perintah start yang pasti.
