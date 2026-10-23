@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-SCRIPT_VERSION='0.3.2'
+SCRIPT_VERSION='0.3.3'
 MODE='audit'
 ALLOW_CONTAINER=0
 UPDATE_NVM=0
@@ -32,7 +32,7 @@ NVM_PRESENT=0
 
 usage() {
 cat <<'HELP'
-Ubuntu Maintenance v0.3.2 — terminal-only (no report upload or saved logs)
+Ubuntu Maintenance v0.3.3 — terminal-only (no report upload or saved logs)
 
   bash ubuntu-maintenance-v03.sh --audit             # regular user or root
   sudo bash ubuntu-maintenance-v03.sh --audit        # fuller host inventory
@@ -63,7 +63,7 @@ HELP
 demo() {
 cat <<'DEMO'
 ╔════════════════════════════════════════════════════════════════════╗
-║  UBUNTU MAINTENANCE v0.3.2 • SIMULASI (BUKAN HASIL SERVER ASLI)   ║
+║  UBUNTU MAINTENANCE v0.3.3 • SIMULASI (BUKAN HASIL SERVER ASLI)   ║
 ╚════════════════════════════════════════════════════════════════════╝
 [15:08:21] Mode              : APPLY
 [15:08:21] Hostname          : prod-api-01
@@ -155,7 +155,7 @@ cleanup() {
   exit "$rc"
 }
 trap cleanup EXIT
-trap 'err "Unexpected error on line $LINENO"; exit 2' ERR
+trap 'rc=$?; err "Perintah gagal di baris $LINENO (exit code $rc). Periksa output sebelumnya."; exit 2' ERR
 
 TMP=$(mktemp -d /tmp/ubuntu-maintenance.XXXXXXXX)
 chmod 700 "$TMP"
@@ -515,31 +515,55 @@ if [[ $MODE == apply ]]; then
     if [[ -r /var/lib/dpkg/status ]]; then
       dpkg-query -W -f='${binary:Package}\t${Version}\n' > "$TMP/packages-before" 2>/dev/null || true
     fi
-    # Refuse if a managed Node major jump is already indicated in APT repo.
-    if command -v apt-cache >/dev/null 2>&1 && command -v dpkg-query >/dev/null 2>&1; then
+    # Resolve the APT candidate AFTER refreshing repository metadata.
+    # Read the full apt-cache output into a temporary file: piping its output
+    # into an early-exiting awk can raise SIGPIPE with `set -o pipefail`.
+    # If the candidate cannot be checked for installed Node, fail safely.
+    node_apt_major_check() {
+      local installed candidate installed_major candidate_major error_message
+      command -v dpkg-query >/dev/null 2>&1 || { err 'dpkg-query tidak tersedia; upgrade dibatalkan'; return 1; }
       installed=$(dpkg-query -W -f='${Version}' nodejs 2>/dev/null || true)
-      candidate=$(apt-cache policy nodejs 2>/dev/null | awk '/Candidate:/{print $2;exit}')
-      installed_major=$(printf '%s' "$installed" | grep -oE '^[0-9]+\.[0-9]+|[0-9]+\.[0-9]+' | head -1 | cut -d. -f1 || true)
-      candidate_major=$(printf '%s' "$candidate" | grep -oE '^[0-9]+\.[0-9]+|[0-9]+\.[0-9]+' | head -1 | cut -d. -f1 || true)
-      if [[ -n $installed_major && -n $candidate_major && $installed_major != "$candidate_major" ]]; then
+      if [[ -z $installed ]]; then
+        log 'Node.js tidak dikelola paket APT: pemeriksaan major Node APT dilewati.'
+        return 0
+      fi
+      command -v apt-cache >/dev/null 2>&1 || { err 'apt-cache tidak tersedia; upgrade dibatalkan'; return 1; }
+      if ! apt-cache policy nodejs > "$TMP/node-apt-policy" 2> "$TMP/node-apt-policy-stderr"; then
+        error_message=$(sed -n '1p' "$TMP/node-apt-policy-stderr")
+        err "Gagal membaca apt-cache policy nodejs: ${error_message:-periksa konfigurasi repository APT}. Upgrade dibatalkan."
+        return 1
+      fi
+      candidate=$(awk '$1=="Candidate:" {print $2}' "$TMP/node-apt-policy")
+      if [[ -z $candidate || $candidate == '(none)' ]]; then
+        warn "Node.js terpasang ($installed), tetapi kandidat APT tidak tersedia. Node tidak akan diperbarui oleh APT."
+        return 0
+      fi
+      # Debian package versions may have an epoch (for example 2:22.2.0).
+      installed_major=$(printf '%s\n' "${installed#*:}" | awk -F '.' '$1~/^[0-9]+$/ {print $1}')
+      candidate_major=$(printf '%s\n' "${candidate#*:}" | awk -F '.' '$1~/^[0-9]+$/ {print $1}')
+      if [[ -z $installed_major || -z $candidate_major ]]; then
+        err "Tidak bisa membandingkan major Node APT: $installed -> $candidate. Upgrade dibatalkan."
+        return 1
+      fi
+      log "Node APT: $installed -> $candidate (major $installed_major -> $candidate_major)"
+      if [[ $installed_major != "$candidate_major" ]]; then
         err "Node APT kandidat major berbeda ($installed -> $candidate). Upgrade dibatalkan; review repo dahulu."
+        return 1
+      fi
+      return 0
+    }
+    if run_live 'apt-get update' env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none NEEDRESTART_MODE=l apt-get -o DPkg::Lock::Timeout=60 update; then
+      if node_apt_major_check; then
+        if run_live 'apt-get upgrade (paket mungkin memicu restart sendiri)' env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none NEEDRESTART_MODE=l apt-get -o DPkg::Lock::Timeout=60 -o Dpkg::Options::=--force-confold -y upgrade; then
+          APT_RAN=1
+        else
+          APPLY_ABORTED=1
+        fi
+      else
         APPLY_ABORTED=1
       fi
-    fi
-    if ((APPLY_ABORTED==0)); then
-      if run_live 'apt-get update' env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none NEEDRESTART_MODE=l apt-get -o DPkg::Lock::Timeout=60 update; then
-        # Re-check after update: repository metadata may have changed.
-        installed=$(dpkg-query -W -f='${Version}' nodejs 2>/dev/null || true)
-        candidate=$(apt-cache policy nodejs 2>/dev/null | awk '/Candidate:/{print $2;exit}')
-        installed_major=$(printf '%s' "$installed" | grep -oE '[0-9]+\.[0-9]+' | head -1 | cut -d. -f1 || true)
-        candidate_major=$(printf '%s' "$candidate" | grep -oE '[0-9]+\.[0-9]+' | head -1 | cut -d. -f1 || true)
-        if [[ -n $installed_major && -n $candidate_major && $installed_major != "$candidate_major" ]]; then
-          err "APT repo offers Node major jump ($installed -> $candidate); skipping upgrade"
-          APPLY_ABORTED=1
-        elif run_live 'apt-get upgrade (paket mungkin memicu restart sendiri)' env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none NEEDRESTART_MODE=l apt-get -o DPkg::Lock::Timeout=60 -o Dpkg::Options::=--force-confold -y upgrade; then
-          APT_RAN=1
-        else APPLY_ABORTED=1; fi
-      else APPLY_ABORTED=1; fi
+    else
+      APPLY_ABORTED=1
     fi
     dpkg-query -W -f='${binary:Package}\t${Version}\n' > "$TMP/packages-after" 2>/dev/null || true
     awk -F '\t' 'NR==FNR{v[$1]=$2;next} ($1 in v) && v[$1]!=$2 {print $1"|"v[$1]"|"$2}' "$TMP/packages-before" "$TMP/packages-after" > "$TMP/packages-changed"
@@ -646,6 +670,15 @@ if [[ $MODE == apply && $APT_RAN -eq 1 && $RESTART -eq 1 && $CONTAINER == no ]];
         ok "PM2 $user/$name: reload selesai"; restart_record "pm2:$user/$name" OK online
       else err "PM2 $user/$name: gagal"; restart_record "pm2:$user/$name" FAIL reload; RESTART_FAILED=1; break; fi
     done < "$TMP/pm2-before"
+  fi
+  # A bare Node process cannot be safely restarted without knowing its supervisor.
+  # Make this visible; a binary can be updated while the existing process stays old.
+  if ((NODE_CHANGED)); then
+    while IFS='|' read -r manager user name status pid exe; do
+      [[ $manager == process && $exe == /usr/bin/node* ]] || continue
+      if [[ -s $TMP/pm2-before ]] && awk -F '|' -v p="$pid" '$4==p {f=1} END {exit !f}' "$TMP/pm2-before"; then continue; fi
+      warn "Node process $user/$name (PID $pid) tidak memiliki supervisor teridentifikasi; restart manual diperlukan agar memakai Node baru."
+    done < "$TMP/node-apps-before"
   fi
   [[ -s $TMP/restart-results ]] || log 'Tidak ada restart yang diperlukan / terverifikasi aman.'
 elif [[ $MODE == apply ]]; then
