@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Ubuntu Maintenance — terminal-only audit / same-release package upgrades
+# Ubuntu Maintenance — terminal-only audit, runtime upgrades, lifecycle verification
 # Intended for reviewed, trusted hosts. No network upload, external telemetry, or stored reports.
 set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-SCRIPT_VERSION='0.4.2'
+SCRIPT_VERSION='0.4.5'
 MODE='audit'
 ALLOW_CONTAINER=0
 UPDATE_NVM=0
@@ -27,6 +27,7 @@ WEB_CHANGED=0
 APT_RAN=0
 RESTART_FAILED=0
 PM2_DISCOVERED=0
+PM2_DISCOVERY_INCOMPLETE=0
 APPLY_ABORTED=0
 NVM_PRESENT=0
 NODE_LTS=0
@@ -44,15 +45,20 @@ NODE_SOURCE_SWITCHED=0
 NODE_MAJOR_INSTALLED=0
 START_PHASE_DONE=0
 STOP_PHASE_ENTERED=0
+CHECK_URLS=()
+WEB_HEALTH_FAIL=0
+WEB_HEALTH_WARN=0
+WEB_PROBE_PASS=0
+WEB_PROBE_FAIL=0
 
 usage() {
 cat <<'HELP'
-Ubuntu Maintenance v0.4.2 — terminal-only (no report upload or saved logs)
+Ubuntu Maintenance v0.4.5 — terminal-only (no report upload or saved logs)
 
-  bash ubuntu-maintenance-v0.4.2.sh --audit             # regular user or root
-  sudo bash ubuntu-maintenance-v0.4.2.sh --audit        # fuller host inventory
-  bash ubuntu-maintenance-v0.4.2.sh --demo              # simulated terminal view
-  sudo bash ubuntu-maintenance-v0.4.2.sh --apply        # stop managed apps, upgrade runtimes, start and verify
+  bash ubuntu-maintenance-v0.4.5.sh --audit             # regular user or root
+  sudo bash ubuntu-maintenance-v0.4.5.sh --audit        # fuller host inventory
+  bash ubuntu-maintenance-v0.4.5.sh --demo              # simulated terminal view
+  sudo bash ubuntu-maintenance-v0.4.5.sh --apply        # stop managed apps, upgrade runtimes, start and verify
 
 Options:
   --audit                 Read-only inventory (default), supports non-root/container
@@ -60,8 +66,10 @@ Options:
   --allow-container-apply Explicitly permit APT inside container (no auto restarts)
   --update-nvm            Update NVM default within its existing major (optional)
   --node-lts              Require a recognized NodeSource path to Node 24 LTS (strict mode)
-  --no-restart            Do not stop/start managed apps (not recommended for major upgrades)
+  --no-restart            Skip automatic PHP/Node stop/start and local web-server restart
   --no-public-ip          Never contact an external IP lookup endpoint
+  --check-url URL         Check an HTTP(S) endpoint before/after (repeatable)
+                         Example: --check-url http://10.0.0.126:3000/
   --disk-path PATH        Filesystem to report (default /)
   --demo                  Simulated, fictional output; no system operations
   -h, --help              Show this help
@@ -69,9 +77,11 @@ Options:
 Important:
 * APT updates installed Ubuntu-managed PHP/Node packages, NOT NVM/asdf/fnm,
   Docker images, or binaries installed manually. PHP 8.5 requires an existing compatible APT repository; the script never silently adds a PPA.
-* Managed PHP/Node systemd services and online PM2 apps are stopped before changing packages and started afterward, including recovery attempts on failure. An unsupervised process cannot be safely restarted automatically and remains running; restart it manually.
+* Root manages PM2 as each owning user with its own HOME/PM2_HOME (not the root PM2 list). PM2 installations with custom PM2_HOME need manual handling.
+* Managed PHP/Node systemd services and online PM2 apps are stopped before changing packages and started afterward, including recovery attempts on failure. Local active Nginx/Apache is restarted after apps start, if its configuration test passes. An unsupervised process (screen/tmux/nohup) cannot be safely restarted automatically without its original startup configuration.
+* A process with /proc/PID/exe marked (deleted), or an executable inode different from the current binary, is reported STALE on every run (audit and apply), including when APT changed no packages.
 * PHP 8.5 CLI migration runs only for CLI-only installs with matching modules; existing PHP-FPM virtual hosts are never automatically rewired. Latest PHP major may remain pending on FPM-backed sites.
-* Apply needs no configuration file; post-upgrade verification checks process/systemd/PM2 status, not HTTP functionality. During the stop→start window, monitored applications may be unavailable.
+* Apply needs no configuration file; HTTP GET is checked on identified local TCP ports and optional --check-url values. HTTP response checks do not guarantee database/queue functionality. During the stop→start window, monitored applications may be unavailable.
 * No automatic reboot, rollback, or container orchestration actions.
 * apt-get itself can restart services before our controlled restart phase.
 * Only terminal text is output; an internal temporary directory is removed on exit.
@@ -81,7 +91,7 @@ HELP
 demo() {
 cat <<'DEMO'
 ╔════════════════════════════════════════════════════════════════════╗
-║  UBUNTU MAINTENANCE v0.4.2 • SIMULASI (BUKAN HASIL SERVER ASLI)   ║
+║  UBUNTU MAINTENANCE v0.4.5 • SIMULASI (BUKAN HASIL SERVER ASLI)   ║
 ╚════════════════════════════════════════════════════════════════════╝
 [15:08:21] Mode              : APPLY
 [15:08:21] Hostname          : prod-api-01
@@ -106,21 +116,26 @@ cat <<'DEMO'
 [15:08:23] ✓ php-fpm  php8.5-fpm.service active
 [15:08:23] ✓ baseline api.service aktif dan webhook PM2 online
 
-──── [03] STOP SERVICE (YANG SEBELUMNYA AKTIF) ────
+──── [03] WEB / PORT AKTIF ────
+[15:08:23] ✓ Web node:api: http://127.0.0.1:3000/ [HTTP 200]
+[15:08:23] ✓ Web custom (--check-url): http://10.0.0.126:3000/ [HTTP 200]
+
+──── [04] STOP SERVICE (YANG SEBELUMNYA AKTIF) ────
 [15:08:24] Stop php8.5-fpm.service   [done]
 [15:08:25] Stop api.service          [done]
 [15:08:26] Stop PM2 deploy/webhook   [done]
 
-──── [04] UPGRADE RUNTIME & PAKET ────
+──── [05] UPGRADE RUNTIME & PAKET ────
 [15:08:30] Apt Update               [done]
 [15:08:38] Node 24 LTS Upgrade      [done]
 [15:08:53] Apt Upgrade              [done]
 [15:08:59] PHP Stable Check         [done]
 
-──── [05] START SERVICE & VERIFIKASI ────
+──── [06] START SERVICE & VERIFIKASI ────
 [15:09:03] Start php8.5-fpm.service  [done]
 [15:09:05] Start api.service         [done]
 [15:09:08] Start PM2 deploy/webhook  [done]
+[15:09:09] Restart nginx.service    [done]
 [15:09:10] Verifikasi proses        [done]
 
 ╔═══════════════════ RINGKASAN ═════════════════════════════════════╗
@@ -147,6 +162,10 @@ while (( $# > 0 )); do
     --node-lts) NODE_LTS=1; AUTO_LTS=0 ;;
     --no-restart) RESTART=0 ;;
     --no-public-ip) PUBLIC_IP_LOOKUP=0 ;;
+    --check-url)
+      (( $# >= 2 )) || { printf 'Missing URL after --check-url\n' >&2; exit 64; }
+      CHECK_URLS+=("$2")
+      shift ;;
     --disk-path)
       (( $# >= 2 )) || { printf 'Argument missing for %s\n' "$1" >&2; exit 64; }
       DISK_PATH=$2
@@ -155,6 +174,12 @@ while (( $# > 0 )); do
     *) printf 'Unknown argument: %s\n' "$1" >&2; usage >&2; exit 64 ;;
   esac
   shift
+done
+for weburl in "${CHECK_URLS[@]}"; do
+  if [[ ! $weburl =~ ^https?://[^/[:space:]@\|]+(/[^[:space:]\|]*)?$ || $weburl == *'@'* ]]; then
+    printf 'Invalid --check-url (use an HTTP/HTTPS address without credentials): %s\n' "$weburl" >&2
+    exit 64
+  fi
 done
 if ((NODE_LTS)) && [[ $MODE != apply ]]; then
   printf '%s\n' '--node-lts requires --apply' >&2
@@ -329,6 +354,7 @@ if [[ $CONTAINER == yes ]]; then warn 'Dalam container: load average biasanya mi
 : > "$TMP/restart-results"
 : > "$TMP/packages-before"; : > "$TMP/packages-after"; : > "$TMP/packages-changed"
 : > "$TMP/pm2-before"; : > "$TMP/pm2-after"
+: > "$TMP/web-endpoints"; : > "$TMP/web-before"; : > "$TMP/web-after"
 
 version_snapshot() {
   local target=$1 runtime=$2 bin ver
@@ -387,8 +413,44 @@ nvm_snapshot() {
   sort -u "$target" -o "$target"
 }
 
-# POSIX name detection; process args not printed to avoid leaking secrets.
+# Process runtime checks never invoke the application or print its arguments.
+# Compare the executable inode (device + inode), not just the path or APT delta.
+# A running process can keep an unlinked Node ELF in memory after upgrades.
 node_exe() { readlink "/proc/$1/exe" 2>/dev/null || true; }
+node_runtime_state() {
+  local pid=$1 exe path process_inode current_inode
+  [[ $pid =~ ^[0-9]+$ && -L /proc/$pid/exe ]] || { printf 'missing'; return 0; }
+  exe=$(node_exe "$pid")
+  [[ -n $exe ]] || { printf 'unknown'; return 0; }
+  if [[ $exe == *' (deleted)' ]]; then printf 'stale'; return 0; fi
+  path=$exe
+  [[ -e $path ]] || { printf 'stale'; return 0; }
+  process_inode=$(stat -Lc '%d:%i' "/proc/$pid/exe" 2>/dev/null || true)
+  current_inode=$(stat -Lc '%d:%i' "$path" 2>/dev/null || true)
+  if [[ -z $process_inode || -z $current_inode ]]; then
+    printf 'unknown'
+  elif [[ $process_inode == "$current_inode" ]]; then
+    printf 'current'
+  else
+    printf 'stale'
+  fi
+}
+# Only describe common parent supervisors; do not infer a safe startup command.
+node_parent_manager() {
+  local pid=$1 next cmd step
+  for ((step=0; step<10; step++)); do
+    next=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ' || true)
+    [[ $next =~ ^[0-9]+$ && $next -gt 1 && $next != "$pid" ]] || break
+    cmd=$(ps -o comm= -p "$next" 2>/dev/null || true)
+    case "$cmd" in
+      screen|SCREEN) printf 'screen'; return 0 ;;
+      tmux|tmux\:*) printf 'tmux'; return 0 ;;
+      supervisord) printf 'supervisord'; return 0 ;;
+    esac
+    pid=$next
+  done
+  printf 'unknown'
+}
 service_for_pid() {
   local pid=$1
   [[ -r /proc/$pid/cgroup ]] || return 0
@@ -416,23 +478,27 @@ node_proc_inventory() {
 
 pm2_for_home() {
   local home=$1 x
-  for x in /usr/bin/pm2 /usr/local/bin/pm2 "$home"/.nvm/versions/node/v*/bin/pm2; do
+  for x in "$home"/.npm-global/bin/pm2 "$home"/.local/bin/pm2 "$home"/.local/share/pnpm/pm2 "$home"/.nvm/versions/node/v*/bin/pm2 /usr/bin/pm2 /usr/local/bin/pm2; do
     [[ -x $x ]] && { printf '%s' "$x"; return; }
   done
   return 1
 }
 
 pm2_inventory() {
-  local target=$1 phase=$2 username unused uid gid gecos home shell pid bin raw
+  local target=$1 phase=$2 username unused uid gid gecos home shell pid bin raw parsed
   : > "$target"
-  command -v python3 >/dev/null 2>&1 || { warn 'Python3 tidak tersedia: PM2 app discovery terbatas.'; return; }
+  command -v python3 >/dev/null 2>&1 || { warn 'Python3 tidak tersedia: PM2 app discovery terbatas.'; PM2_DISCOVERY_INCOMPLETE=1; return; }
   while IFS=: read -r username unused uid gid gecos home shell; do
     [[ -r $home/.pm2/pm2.pid ]] || continue
     if ((EUID!=0)) && [[ $username != "$EXEC_USER" ]]; then continue; fi
     pid=$(cat "$home/.pm2/pm2.pid" 2>/dev/null || true)
     [[ $pid =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null || continue
     bin=$(pm2_for_home "$home" || true)
-    if [[ -z $bin ]]; then warn "PM2 daemon user=$username terdeteksi, CLI tidak tersedia"; continue; fi
+    if [[ -z $bin ]]; then
+      warn "PM2 daemon user=$username terdeteksi, tetapi executable PM2 tidak ditemukan."
+      PM2_DISCOVERY_INCOMPLETE=1
+      continue
+    fi
     raw="$TMP/pm2-${phase}-${username}.json"
     # Avoid pm2 starting daemons when none exist; existing pid was checked.
     if ((EUID==0)); then
@@ -440,14 +506,23 @@ pm2_inventory() {
     else
       timeout 10 env PM2_HOME="$home/.pm2" PATH="$(dirname "$bin"):$PATH" "$bin" jlist > "$raw" 2>/dev/null || true
     fi
-    [[ -s $raw ]] || continue
-    python3 - "$raw" "$username" "$bin" >> "$target" <<'PY'
+    if [[ ! -s $raw ]]; then
+      warn "PM2 user=$username terdeteksi tetapi inventaris aplikasi tidak dapat dibaca."
+      PM2_DISCOVERY_INCOMPLETE=1
+      continue
+    fi
+    parsed="$TMP/pm2-${phase}-${username}.parsed"
+    if python3 - "$raw" "$username" "$bin" > "$parsed" <<'PY'
 import json,sys
 try:
     with open(sys.argv[1]) as f: apps=json.load(f)
 except (ValueError,OSError):
-    apps=[]
-for app in apps if isinstance(apps,list) else []:
+    sys.exit(3)
+if not isinstance(apps,list):
+    sys.exit(3)
+for app in apps:
+    if not isinstance(app,dict):
+        sys.exit(3)
     e=app.get('pm2_env') or {}
     name=str(app.get('name') or 'unnamed').replace('|','/').replace('\n',' ')[:80]
     status=str(e.get('status') or 'unknown')[:24]
@@ -457,6 +532,12 @@ for app in apps if isinstance(apps,list) else []:
     if not isinstance(pm_id,int): continue
     print('|'.join((sys.argv[2], name, status, str(pid), str(pm_id), sys.argv[3])))
 PY
+    then
+      cat "$parsed" >> "$target"
+    else
+      warn "PM2 user=$username mengembalikan JSON tidak valid; daftar aplikasinya tidak aman untuk diubah."
+      PM2_DISCOVERY_INCOMPLETE=1
+    fi
   done < /etc/passwd
 }
 
@@ -548,7 +629,16 @@ node_proc_inventory "$TMP/node-apps-before"
 pm2_inventory "$TMP/pm2-before" before
 services_inventory "$TMP/services-before"
 if [[ -s $TMP/node-apps-before ]]; then
-  while IFS='|' read -r manager user name status pid exe; do log "Node [$manager] user=$user app=$name status=$status PID=$pid runtime=${exe:-unknown}"; done < "$TMP/node-apps-before"
+  while IFS='|' read -r manager user name status pid exe; do
+    state=$(node_runtime_state "$pid")
+    if [[ $state == stale ]]; then
+      warn "Node [$manager] user=$user app=$name PID=$pid: EXECUTABLE LAMA (deleted/inode berubah). Restart diperlukan; runtime=${exe:-N/A}"
+    elif [[ $state == current ]]; then
+      log "Node [$manager] user=$user app=$name status=$status PID=$pid runtime=${exe:-unknown} [runtime sesuai]"
+    else
+      warn "Node [$manager] user=$user app=$name status=$status PID=$pid: executable tidak bisa diverifikasi (${state})."
+    fi
+  done < "$TMP/node-apps-before"
 else log 'Proses Node host: tidak ditemukan / tidak dapat diakses'; fi
 if [[ -s $TMP/pm2-before ]]; then
   while IFS='|' read -r user name status pid id bin; do log "PM2 user=$user app=$name status=$status PID=$pid"; done < "$TMP/pm2-before"
@@ -560,11 +650,241 @@ if command -v docker >/dev/null 2>&1 && [[ $CONTAINER == no ]]; then
   docker ps --format '  container={{.Names}} image={{.Image}} status={{.Status}}' 2>/dev/null || true
 fi
 
+# Capture only TCP listeners tied to Node/PHP and HTTP reverse proxies.
+# No network-wide port scan and no guessing remote services.
+web_discover() {
+  local source_file="$TMP/ss-before" url clean_label
+  : > "$TMP/web-endpoints"
+  if command -v ss >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+    ss -H -ltnp > "$source_file" 2>/dev/null || true
+    python3 - "$source_file" "$TMP/node-apps-before" "$TMP/web-endpoints" <<'PYWEB'
+import re, sys
+from pathlib import Path
+socket_file, app_file, out_file = map(Path, sys.argv[1:])
+node_by_pid = {}
+for line in app_file.read_text(errors='replace').splitlines():
+    parts = line.split('|')
+    if len(parts) >= 5 and parts[4].isdigit():
+        node_by_pid[parts[4]] = parts[2]
+items, seen = [], set()
+for line in socket_file.read_text(errors='replace').splitlines():
+    fields = line.split()
+    if len(fields) < 4:
+        continue
+    listen_address = fields[3]
+    m = re.search(r':(\d+)$', listen_address)
+    if not m:
+        continue
+    port = int(m.group(1))
+    if port < 1 or port > 65535:
+        continue
+    pids = re.findall(r'pid=(\d+)', line)
+    procnames = re.findall(r'"([^"\\]+)"\s*,\s*pid=', line)
+    nodepid = next((pid for pid in pids if pid in node_by_pid), '')
+    known_type = ('node' if nodepid else
+                  'nginx' if any(x.startswith('nginx') for x in procnames) else
+                  'apache' if any(x in ('apache2','httpd') for x in procnames) else
+                  'php' if any(x.startswith('php-fpm') or x.startswith('php') for x in procnames) else '')
+    if not known_type:
+        continue
+    if known_type in ('nginx','apache') and port not in (80,443,8080,8443):
+        continue
+    addr = listen_address[:m.start()]
+    # Local connectivity uses loopback only for wildcard bind addresses.
+    if addr in ('0.0.0.0','*','127.0.0.1'):
+        host = '127.0.0.1'
+    elif addr in ('[::]','::','[::1]','::1'):
+        host = '[::1]'
+    else:
+        host = addr
+    scheme = 'https' if port in (443,8443) else 'http'
+    url = f'{scheme}://{host}:{port}/'
+    key=(known_type, url)
+    if key in seen:
+        continue
+    seen.add(key)
+    label = (f'node:{node_by_pid[nodepid]}' if nodepid else known_type)
+    label = label.replace('|','/').replace('\n',' ')[:70]
+    items.append(f'auto|{label}|{url}|{listen_address}|{port}')
+with out_file.open('a') as out:
+    for item in items[:20]:
+        out.write(item+'\n')
+PYWEB
+  fi
+  for url in "${CHECK_URLS[@]}"; do
+    if ! awk -F '|' -v target="$url" '$3==target {found=1} END{exit !found}' "$TMP/web-endpoints"; then
+      printf 'manual|custom|%s|N/A|N/A\n' "$url" >> "$TMP/web-endpoints"
+    fi
+  done
+}
+
+# HTTP GET to root or explicit path; do not follow redirects, use proxies, or
+# send secrets/HTTP request bodies. HTTP >=400 is not automatically 'offline'.
+web_probe() {
+  local target=$1 phase=$2 source label url addr port code rc state attempt idx=0
+  : > "$target"
+  while IFS='|' read -r source label url addr port; do
+    [[ -n $url ]] || continue
+    idx=$((idx+1))
+    code='000'; rc=1; attempt=1
+    local tries=1
+    [[ $phase == AFTER && $MODE == apply ]] && tries=3
+    for ((attempt=1;attempt<=tries;attempt++)); do
+      if command -v curl >/dev/null 2>&1; then
+        if code=$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 4 --max-redirs 0 "$url" 2>/dev/null); then
+          rc=0
+          [[ $code =~ ^[0-9]{3}$ ]] || code=000
+        else
+          rc=$?; code=000
+        fi
+      else
+        code=000; rc=127
+      fi
+      [[ $rc == 0 && $code != 000 ]] && break
+      if (( attempt < tries )); then sleep 1; fi
+    done
+    if [[ $phase == AFTER && $source == auto && -f $TMP/ss-after ]] && ! awk -v addr="$addr" '$4==addr {found=1} END{exit !found}' "$TMP/ss-after"; then
+      state='PORT_CLOSED'; code=000
+    elif [[ $code =~ ^[23][0-9][0-9]$ ]]; then state='HTTP_OK'
+    elif [[ $code == 401 || $code == 403 ]]; then state='AUTH'
+    elif [[ $code =~ ^[45][0-9][0-9]$ ]]; then state='HTTP_ERROR'
+    else state='NO_HTTP'; fi
+    printf '%s|%s|%s|%s|%s\n' "$idx" "$url" "$source" "$state" "$code" >> "$target"
+    case "$state" in
+      HTTP_OK) ok "Web $label : $url [HTTP $code]" ;;
+      AUTH) log "Web $label : $url [HTTP $code, akses dibatasi]" ;;
+      HTTP_ERROR) warn "Web $label : $url [HTTP $code, aplikasi merespons error]" ;;
+      PORT_CLOSED) err "Web $label : $url [port tidak lagi LISTEN]" ;; 
+      NO_HTTP) log "Web $label : $url [tidak ada respons HTTP; mungkin port non-HTTP/firewall]" ;;
+    esac
+  done < "$TMP/web-endpoints"
+}
+
+web_compare() {
+  local idx url source state code old oldstate oldcode
+  local healthy=0 restricted=0 failed=0 unknown=0
+  while IFS='|' read -r idx url source state code; do
+    [[ -n $idx ]] || continue
+    old=$(awk -F '|' -v id="$idx" '$1==id{print $4"|"$5;exit}' "$TMP/web-before")
+    oldstate=${old%%|*}; oldcode=${old#*|}
+    case "$state" in
+      HTTP_OK) healthy=$((healthy+1)) ;;
+      AUTH) restricted=$((restricted+1)) ;;
+      PORT_CLOSED)
+        failed=$((failed+1))
+        WEB_HEALTH_FAIL=$((WEB_HEALTH_FAIL+1))
+        ;;
+      HTTP_ERROR)
+        failed=$((failed+1))
+        if [[ $source == manual || $oldstate == HTTP_OK || $oldstate == AUTH ]]; then
+          err "Web gagal: $url sebelum=$oldcode sesudah=$code"
+          WEB_HEALTH_FAIL=$((WEB_HEALTH_FAIL+1))
+        else
+          warn "Web $url: HTTP $code; perlu pemeriksaan aplikasi"
+          WEB_HEALTH_WARN=$((WEB_HEALTH_WARN+1))
+        fi ;;
+      *)
+        unknown=$((unknown+1))
+        if [[ $source == manual || $oldstate == HTTP_OK || $oldstate == AUTH ]]; then
+          err "Web tidak merespons: $url (sebelum ${oldcode:-000}, sesudah 000)"
+          WEB_HEALTH_FAIL=$((WEB_HEALTH_FAIL+1))
+        else
+          warn "Web $url: port terdeteksi, tetapi HTTP belum terverifikasi"
+          WEB_HEALTH_WARN=$((WEB_HEALTH_WARN+1))
+        fi ;;
+    esac
+  done < "$TMP/web-after"
+  WEB_PROBE_PASS=$((healthy+restricted))
+  WEB_PROBE_FAIL=$((failed+unknown))
+  log "HTTP URL: $healthy OK / $restricted dibatasi / $failed error / $unknown tidak terverifikasi."
+}
+
+section 'WEB / PORT AKTIF (SEBELUM PERUBAHAN)'
+web_discover
+if [[ -s $TMP/web-endpoints ]]; then
+  web_probe "$TMP/web-before" BEFORE
+else
+  log 'Tidak menemukan port TCP yang dapat dipetakan; gunakan --check-url URL untuk pemeriksaan tambahan.'
+fi
+
 section 'BASELINE SERVICE / PROSES'
 log 'Baseline dicatat otomatis dari systemd, PM2, dan proses Node.js.'
 log 'Tidak perlu konfigurasi tambahan. Status proses saja tidak menjamin fungsi API/DB/queue.'
 
 restart_record() { printf '%s|%s|%s\n' "$1" "$2" "$3" >> "$TMP/restart-results"; }
+
+# Validate active local web servers BEFORE stopping applications. Never restart
+# an invalid configuration just because a runtime was upgraded.
+web_preflight() {
+  local unit status check
+  [[ $CONTAINER == no && $RESTART -eq 1 ]] || return 0
+  while IFS='|' read -r unit status; do
+    [[ $status == active ]] || continue
+    case "$unit" in
+      nginx.service)
+        check=nginx
+        if ! command -v "$check" >/dev/null 2>&1 || ! "$check" -t >"$TMP/web-preflight-nginx.log" 2>&1; then
+          err "Konfigurasi nginx tidak valid: proses upgrade dibatalkan sebelum stop service."
+          return 1
+        fi
+        ;;
+      apache2.service)
+        check=apache2ctl
+        if ! command -v "$check" >/dev/null 2>&1 || ! "$check" configtest >"$TMP/web-preflight-apache.log" 2>&1; then
+          err "Konfigurasi Apache tidak valid: proses upgrade dibatalkan sebelum stop service."
+          return 1
+        fi
+        ;;
+    esac
+  done < "$TMP/services-before"
+  return 0
+}
+
+# A --check-url may target ANOTHER host; we never restart that remote machine.
+# Only web servers locally active at baseline are restarted here.
+restart_local_web() {
+  local unit status check validation_args
+  [[ $CONTAINER == no && $RESTART -eq 1 && $APT_RAN -eq 1 ]] || return 0
+  section 'RESTART WEB SERVER LOKAL'
+  local found=0 failure=0
+  while IFS='|' read -r unit status; do
+    [[ $status == active ]] || continue
+    case "$unit" in nginx.service|apache2.service) ;; *) continue ;; esac
+    found=1
+    # Apache with mod_php may already be included in the stop/start plan.
+    # Avoid performing a second restart of a service just recovered.
+    if [[ -s $TMP/stopped-services ]] && grep -Fxq -- "$unit" "$TMP/stopped-services"; then
+      ok "$unit sudah direstart lewat siklus stop/start sebelumnya."
+      continue
+    fi
+    if [[ $unit == nginx.service ]]; then
+      if ! command -v nginx >/dev/null 2>&1 || ! nginx -t >"$TMP/nginx-config.log" 2>&1; then
+        err "Restart $unit dibatalkan: konfigurasi Nginx tidak valid."
+        restart_record "$unit" FAIL config
+        failure=1
+        continue
+      fi
+    else
+      if ! command -v apache2ctl >/dev/null 2>&1 || ! apache2ctl configtest >"$TMP/apache-config.log" 2>&1; then
+        err "Restart $unit dibatalkan: konfigurasi Apache tidak valid."
+        restart_record "$unit" FAIL config
+        failure=1
+        continue
+      fi
+    fi
+    if run_quiet "Restart $unit" systemctl restart "$unit" && systemctl is-active --quiet "$unit"; then
+      restart_record "$unit" OK active
+    else
+      err "$unit gagal restart atau tidak active."
+      restart_record "$unit" FAIL restart
+      failure=1
+    fi
+  done < "$TMP/services-before"
+  if (( found == 0 )); then log 'Nginx/Apache tidak aktif sebelumnya; tidak ada web server lokal yang direstart.'; fi
+  if (( failure )); then RESTART_FAILED=1; return 1; fi
+  return 0
+}
+
 
 # Snapshot-driven lifecycle. Never stop bare process/screen/tmux workloads:
 # their startup commands and environment cannot be faithfully reconstructed.
@@ -773,7 +1093,10 @@ node_lts_install() {
 }
 
 if [[ $MODE == apply ]]; then
-  if [[ $ERRORS -ne 0 ]]; then err 'Baseline bermasalah; upgrade dibatalkan'; APPLY_ABORTED=1
+  if (( PM2_DISCOVERY_INCOMPLETE )); then
+    err 'Inventaris PM2 belum lengkap; upgrade dihentikan agar tidak mematikan aplikasi milik user lain.'
+    APPLY_ABORTED=1
+  elif [[ $ERRORS -ne 0 ]]; then err 'Baseline bermasalah; upgrade dibatalkan'; APPLY_ABORTED=1
   elif (( $(df -Pk / | awk 'NR==2 {print $4}') < 1048576 )); then
     err 'Free disk / < 1 GiB. Upgrade dibatalkan.'; APPLY_ABORTED=1
   elif command -v fuser >/dev/null 2>&1 && fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then
@@ -783,7 +1106,11 @@ if [[ $MODE == apply ]]; then
     if [[ -r /var/lib/dpkg/status ]]; then
       dpkg-query -W -f='${binary:Package}\t${Version}\n' > "$TMP/packages-before" 2>/dev/null || true
     fi
-    if ! stop_managed; then APPLY_ABORTED=1; fi
+    if ! web_preflight; then
+      APPLY_ABORTED=1
+    elif ! stop_managed; then
+      APPLY_ABORTED=1
+    fi
   fi
   if ((APPLY_ABORTED==0)); then
     # Default --apply upgrades NodeSource-managed Node to production LTS.
@@ -1051,21 +1378,10 @@ if [[ $MODE == apply ]]; then
   else
     log 'Tidak ada service yang dihentikan (maintenance dibatalkan sebelum tahap stop).'
   fi
-  # Reload web server only if its own packages changed; PHP-FPM starts through snapshot.
-  if (( WEB_CHANGED == 1 && APT_RAN == 1 && RESTART == 1 )) && [[ $CONTAINER == no ]]; then
-    while IFS='|' read -r unit status; do
-      [[ $status == active ]] || continue
-      case "$unit" in
-        nginx.service)
-          if ! nginx -t >"$TMP/nginx-config.log" 2>&1 || ! run_quiet 'Reload nginx' systemctl reload nginx.service; then
-            err 'Reload nginx gagal.'; RESTART_FAILED=1
-          fi ;;
-        apache2.service)
-          if ! apache2ctl configtest >"$TMP/apache-config.log" 2>&1 || ! run_quiet 'Reload Apache' systemctl reload apache2.service; then
-            err 'Reload Apache gagal.'; RESTART_FAILED=1
-          fi ;;
-      esac
-    done < "$TMP/services-before"
+  # Restart web servers that were previously active, even when their package
+  # did not change. Service startup has completed before this stage.
+  if ! restart_local_web; then
+    err 'Sebagian web server lokal gagal direstart; lihat status service dan URL.'
   fi
 fi
 
@@ -1075,24 +1391,6 @@ version_snapshot "$TMP/node-after" node
 nvm_snapshot "$TMP/nvm-after"
 node_proc_inventory "$TMP/node-apps-after"
 pm2_inventory "$TMP/pm2-after" after
-if (( NODE_MAJOR_INSTALLED == 1 && NODE_CHANGED == 1 )) && [[ -s $TMP/pm2-before ]]; then
-  while IFS='|' read -r u app status pid id bin; do
-    [[ $status == online && $pid =~ ^[0-9]+$ ]] || continue
-    # Only check PM2 workloads that previously ran under system Node.
-    prior=$(node_exe "$pid")
-    [[ $prior == /usr/bin/node* ]] || continue
-    newpid=$(awk -F '|' -v user="$u" -v want="$id" '$1==user && $5==want{print $4;exit}' "$TMP/pm2-after")
-    [[ $newpid =~ ^[0-9]+$ && $newpid -gt 0 ]] || { err "PM2 $u/$app: PID pascamigrasi tidak ditemukan"; continue; }
-    liveexe=$(node_exe "$newpid")
-    livever=$("/proc/$newpid/exe" -p 'process.versions.node' 2>/dev/null || true)
-    live_major=${livever%%.*}
-    if [[ $live_major != "$NODE_LTS_MAJOR" ]]; then
-      err "PM2 $u/$app: runtime aktif ${livever:-N/A}, bukan Node $NODE_LTS_MAJOR LTS (binary: $liveexe)"
-    else
-      ok "PM2 $u/$app: proses memakai Node $livever"
-    fi
-  done < "$TMP/pm2-before"
-fi
 show_runtime "$TMP/php-after" 'PHP '
 show_runtime "$TMP/node-after" 'Node'
 if [[ -s $TMP/nvm-after ]]; then
@@ -1128,8 +1426,13 @@ while IFS='|' read -r user name before pid id bin; do
   if [[ $before == online ]]; then
     after=$(awk -F '|' -v u="$user" -v id="$id" '$1==u && $5==id {print $3;exit}' "$TMP/pm2-after")
     if [[ $after == online ]]; then
-      ok "PM2 $user/$name: online setelah pemeriksaan"
-      APP_OK=$((APP_OK+1))
+      newpid=$(awk -F '|' -v u="$user" -v id="$id" '$1==u && $5==id {print $4;exit}' "$TMP/pm2-after")
+      runtime_state=$(node_runtime_state "${newpid:-0}")
+      case "$runtime_state" in
+        current) ok "PM2 $user/$name: online; runtime sesuai (PID=$newpid)"; APP_OK=$((APP_OK+1)) ;;
+        stale) warn "PM2 $user/$name: online tetapi executable Node lama/deleted (PID=$newpid); daemon/startup PM2 perlu diperiksa"; APP_UNVERIFIED=$((APP_UNVERIFIED+1)); UNMANAGED_NODE_POST=$((UNMANAGED_NODE_POST+1)) ;;
+        *) warn "PM2 $user/$name: online, executable tidak dapat diverifikasi (PID=${newpid:-N/A})"; APP_UNVERIFIED=$((APP_UNVERIFIED+1)) ;;
+      esac
     else
       err "PM2 $user/$name: sebelumnya online, sekarang ${after:-tidak ditemukan}"
       APP_FAIL=$((APP_FAIL+1))
@@ -1145,8 +1448,13 @@ while IFS='|' read -r user name before; do
   if [[ $before == active ]]; then
     after=$(awk -F '|' -v u="$user" -v n="$name" '$1=="systemd" && $2==u && $3==n {print $4;exit}' "$TMP/node-apps-after")
     if [[ $after == active ]]; then
-      ok "Node systemd $name: active dan proses Node terdeteksi"
-      APP_OK=$((APP_OK+1))
+      newpid=$(awk -F '|' -v u="$user" -v n="$name" '$1=="systemd" && $2==u && $3==n {print $5;exit}' "$TMP/node-apps-after")
+      runtime_state=$(node_runtime_state "${newpid:-0}")
+      case "$runtime_state" in
+        current) ok "Node systemd $name: active; runtime sesuai (PID=$newpid)"; APP_OK=$((APP_OK+1)) ;;
+        stale) warn "Node systemd $name: active tetapi executable Node lama/deleted (PID=$newpid); restart unit diperlukan"; APP_UNVERIFIED=$((APP_UNVERIFIED+1)); UNMANAGED_NODE_POST=$((UNMANAGED_NODE_POST+1)) ;;
+        *) warn "Node systemd $name: active, executable tidak dapat diverifikasi"; APP_UNVERIFIED=$((APP_UNVERIFIED+1)) ;;
+      esac
     else
       err "Node systemd $name: sebelumnya active, sekarang ${after:-proses tidak terdeteksi}"
       APP_FAIL=$((APP_FAIL+1))
@@ -1161,28 +1469,41 @@ while IFS='|' read -r manager user name before pid exe; do
   # Exclude PM2-managed PIDs, which are checked above.
   if [[ -s $TMP/pm2-before ]] && awk -F '|' -v p="$pid" '$4==p {found=1} END {exit !found}' "$TMP/pm2-before"; then continue; fi
   if awk -F '|' -v u="$user" -v n="$name" '$1=="process" && $2==u && $3==n {found=1} END {exit !found}' "$TMP/node-apps-after"; then
-    if ((NODE_CHANGED)) && [[ $exe == /usr/bin/node* ]]; then
-      # Check matching active PID and executable to avoid claiming the old
-      # running process has switched interpreter after /usr/bin/node is replaced.
-      matching_pid=$(awk -F '|' -v u="$user" -v n="$name" '$1=="process" && $2==u && $3==n {print $5;exit}' "$TMP/node-apps-after")
-      if [[ $matching_pid == "$pid" || $(readlink "/proc/$matching_pid/exe" 2>/dev/null || true) == *' (deleted)' ]]; then
-        warn "Node process $user/$name PID=$pid masih memakai runtime lama; restart manual diperlukan."
+    matching_pid=$(awk -F '|' -v u="$user" -v n="$name" '$1=="process" && $2==u && $3==n {print $5;exit}' "$TMP/node-apps-after")
+    runtime_state=$(node_runtime_state "${matching_pid:-0}")
+    case "$runtime_state" in
+      stale)
+        supervisor=$(node_parent_manager "$matching_pid")
+        warn "Node process $user/$name PID=$matching_pid memakai executable LAMA (deleted/inode berubah). Restart perlu melalui ${supervisor}; tidak dilakukan paksa."
         UNMANAGED_NODE_POST=$((UNMANAGED_NODE_POST+1))
         APP_UNVERIFIED=$((APP_UNVERIFIED+1))
-      else
-        ok "Node process $user/$name: proses berubah (status proses saja)"
+        ;;
+      current)
+        ok "Node process $user/$name: berjalan dengan executable yang cocok (PID=$matching_pid; fungsi HTTP belum diuji)"
         APP_OK=$((APP_OK+1))
-      fi
-    else
-      ok "Node process $user/$name: proses masih terdeteksi"
-      APP_OK=$((APP_OK+1))
-    fi
+        ;;
+      *)
+        warn "Node process $user/$name PID=${matching_pid:-N/A}: executable tidak dapat diverifikasi ($runtime_state)."
+        APP_UNVERIFIED=$((APP_UNVERIFIED+1))
+        ;;
+    esac
   else
     err "Node process $user/$name: proses tidak ditemukan lagi"
     APP_FAIL=$((APP_FAIL+1))
   fi
 done < "$TMP/node-apps-before"
-log "Validasi proses: $APP_OK aktif / $APP_FAIL gagal / $APP_UNVERIFIED tidak terverifikasi; HTTP tidak diperiksa."
+log "Validasi proses: $APP_OK aktif / $APP_FAIL gagal / $APP_UNVERIFIED tidak terverifikasi; HTTP diuji terpisah pada langkah web berikutnya."
+
+section 'WEB / PORT AKTIF (VERIFIKASI)'
+if command -v ss >/dev/null 2>&1; then
+  ss -H -ltnp > "$TMP/ss-after" 2>/dev/null || true
+fi
+if [[ -s $TMP/web-endpoints ]]; then
+  web_probe "$TMP/web-after" AFTER
+  web_compare
+else
+  log 'Tidak ada URL yang diuji. Status aplikasi hanya berdasarkan proses/service.'
+fi
 
 section 'RINGKASAN AKHIR — COPY/PASTE'
 primary_version() {
@@ -1221,7 +1542,7 @@ printf 'RAM               : %s / %s GiB used | %s GiB available\n' "$(gib "$MEM_
 printf 'Disk %-12s : %s / %s GiB used | %s GiB free\n' "$DISK_PATH" "$(gib "$DISK_USED")" "$(gib "$DISK_TOTAL")" "$(gib "$DISK_AVAIL")"
 printf 'PHP               : %s -> %s\n' "$PHP_OLD" "$PHP_NEW"
 printf 'Node.js (%s): %s -> %s\n' "$CURRENT_NODE_PATH" "$NODE_OLD" "$NODE_NEW"
-if ((UNMANAGED_NODE_POST>0)); then printf 'Node apps pending  : %s perlu restart manual (runtime lama masih berjalan)\n' "$UNMANAGED_NODE_POST"; fi
+if ((UNMANAGED_NODE_POST>0)); then printf 'Node apps pending  : %s perlu restart/cek runtime (executable lama masih berjalan)\n' "$UNMANAGED_NODE_POST"; fi
 if [[ -s $TMP/nvm-after ]]; then printf 'NVM installations : %s detected (not necessarily active)\n' "$(wc -l < "$TMP/nvm-after")"; fi
 log 'Aplikasi Node.js (PM2 / systemd / proses):'
 if [[ -s $TMP/pm2-after ]]; then
@@ -1234,7 +1555,9 @@ if [[ -s $TMP/node-apps-after ]]; then
   while IFS='|' read -r manager user name status pid exe; do
     # No double count of same PID if already listed under PM2.
     if [[ -s $TMP/pm2-after ]] && awk -F '|' -v needle="$pid" '$4==needle {found=1} END {exit !found}' "$TMP/pm2-after"; then continue; fi
-    printf '  • %-7s %-18s %-28s %-15s PID=%s\n' "$manager" "$user" "$name" "$status" "$pid"
+    runtime_state=$(node_runtime_state "$pid")
+    case "$runtime_state" in stale) status='STALE (restart needed)' ;; current) status='running (exe OK)' ;; *) status='runtime unverified' ;; esac
+    printf '  • %-7s %-18s %-28s %-23s PID=%s\n' "$manager" "$user" "$name" "$status" "$pid"
     NODE_APPS_COUNT=$((NODE_APPS_COUNT+1))
   done < "$TMP/node-apps-after"
 fi
@@ -1242,12 +1565,13 @@ fi
 printf 'Node app terdeteksi: %s (best-effort, bukan inventaris lengkap)\n' "$NODE_APPS_COUNT"
 printf 'Status aplikasi    : %s aktif / %s gagal / %s unverified (proses saja)\n' "$APP_OK" "$APP_FAIL" "$APP_UNVERIFIED"
 printf 'Restart terkait   : %s OK / %s FAIL\n' "$RESTART_OK" "$RESTART_FAIL"
+printf 'Web URL diperiksa : %s respons / %s belum sehat/terverifikasi\n' "$WEB_PROBE_PASS" "$WEB_PROBE_FAIL"
 if [[ -f /run/reboot-required ]]; then warn 'Server memerlukan reboot (tidak dilakukan otomatis)'; fi
 if ((ERRORS>0 || APPLY_ABORTED==1 || RUNTIME_TARGET_FAILED==1)); then RESULT='FAIL'
 elif ((WARN>0 || APP_UNVERIFIED>0)); then RESULT='REVIEW'
 else RESULT='PASS'; fi
 printf 'PERINGATAN        : %s | ERROR: %s\n' "$WARN" "$ERRORS"
 printf 'HASIL             : %s\n' "$RESULT"
-log 'Keterangan: active/online hanya memastikan proses berjalan; fungsi HTTP/DB/queue tidak diuji.'
+log 'Keterangan: HTTP 2xx/3xx berarti endpoint merespons, bukan bukti DB/queue atau keseluruhan fungsi sehat.'
 log 'Tidak ada log/JSON diunggah atau disimpan permanen oleh skrip.'
 if [[ $RESULT == FAIL ]]; then exit 2; fi
