@@ -5,10 +5,8 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-SCRIPT_VERSION='0.3.1'
+SCRIPT_VERSION='0.3.2'
 MODE='audit'
-HEALTH_FILE='/etc/ubuntu-maintenance/healthchecks.tsv'
-ALLOW_UNVERIFIED=0
 ALLOW_CONTAINER=0
 UPDATE_NVM=0
 NVM_UPDATED=0
@@ -29,13 +27,12 @@ WEB_CHANGED=0
 APT_RAN=0
 RESTART_FAILED=0
 PM2_DISCOVERED=0
-HAVE_HEALTH=0
 APPLY_ABORTED=0
 NVM_PRESENT=0
 
 usage() {
 cat <<'HELP'
-Ubuntu Maintenance v0.3.1 — terminal-only (no report upload or saved logs)
+Ubuntu Maintenance v0.3.2 — terminal-only (no report upload or saved logs)
 
   bash ubuntu-maintenance-v03.sh --audit             # regular user or root
   sudo bash ubuntu-maintenance-v03.sh --audit        # fuller host inventory
@@ -45,8 +42,6 @@ Ubuntu Maintenance v0.3.1 — terminal-only (no report upload or saved logs)
 Options:
   --audit                 Read-only inventory (default), supports non-root/container
   --apply                 apt-get update && apt-get upgrade (Ubuntu, root only)
-  --health-file PATH      name|http://127.0.0.1:PORT/health|200 per line
-  --allow-unverified      Permit apply without HTTP health checks (not recommended)
   --allow-container-apply Explicitly permit APT inside container (no auto restarts)
   --update-nvm            Update NVM default Node within its existing major (root, opt-in)
   --no-restart            Do not automatically restart affected services/PM2 apps
@@ -58,7 +53,7 @@ Options:
 Important:
 * APT updates installed Ubuntu-managed PHP/Node packages, NOT NVM/asdf/fnm,
   Docker images, or binaries installed manually. Major version changes require review.
-* Apply refuses to run without health checks unless --allow-unverified is given.
+* Apply needs no configuration file; post-upgrade verification checks process/systemd/PM2 status, not HTTP functionality.
 * No automatic reboot, rollback, or container orchestration actions.
 * apt-get itself can restart services before our controlled restart phase.
 * Only terminal text is output; an internal temporary directory is removed on exit.
@@ -68,7 +63,7 @@ HELP
 demo() {
 cat <<'DEMO'
 ╔════════════════════════════════════════════════════════════════════╗
-║  UBUNTU MAINTENANCE v0.3  •  SIMULASI (BUKAN HASIL SERVER ASLI)   ║
+║  UBUNTU MAINTENANCE v0.3.2 • SIMULASI (BUKAN HASIL SERVER ASLI)   ║
 ╚════════════════════════════════════════════════════════════════════╝
 [15:08:21] Mode              : APPLY
 [15:08:21] Hostname          : prod-api-01
@@ -91,8 +86,7 @@ cat <<'DEMO'
 [15:08:23] ✓ systemd  api.service        active    /usr/bin/node
 [15:08:23] ✓ pm2      webhook (deploy)   online    PID 8812
 [15:08:23] ✓ php-fpm  php8.3-fpm.service active
-[15:08:23] ✓ health   api              HTTP 200
-[15:08:23] ✓ health   webhook          HTTP 200
+[15:08:23] ✓ baseline api.service aktif dan webhook PM2 online
 
 ──── [03] PEMBARUAN PAKET ────
 [15:08:25] ⠋ apt-get update ... (output APT tetap ditampilkan)
@@ -104,7 +98,7 @@ cat <<'DEMO'
 [15:08:58] ✓ php8.3-fpm.service : restart berhasil; active
 [15:09:01] ✓ api.service        : restart berhasil; active
 [15:09:04] ✓ pm2 deploy/webhook : reload berhasil; online
-[15:09:05] ✓ Health check      : HTTP 200 (2/2)
+[15:09:05] ✓ Verifikasi proses : systemd active; PM2 online
 
 ╔═══════════════════ RINGKASAN ═════════════════════════════════════╗
   Login / eksekusi   : deploy / root
@@ -113,7 +107,7 @@ cat <<'DEMO'
   Node.js (APT)     : v22.23.2 -> v22.23.4
   CPU / RAM / Disk  : 12.8% | 3.20 / 8.00 GiB | 58.00 / 100.00 GiB free
   Node apps         : api.service [active], webhook [online]
-  Health            : 2 PASS / 0 FAIL
+  Status aplikasi   : 2 aktif / 0 gagal (level proses)
   Restart           : 3 OK / 0 FAIL
   Hasil             : PASS (SIMULASI)
 ╚═══════════════════════════════════════════════════════════════════╝
@@ -125,14 +119,13 @@ while (( $# > 0 )); do
     --audit) MODE='audit' ;;
     --apply) MODE='apply' ;;
     --demo) demo; exit 0 ;;
-    --allow-unverified) ALLOW_UNVERIFIED=1 ;;
     --allow-container-apply) ALLOW_CONTAINER=1 ;;
     --update-nvm) UPDATE_NVM=1 ;;
     --no-restart) RESTART=0 ;;
     --no-public-ip) PUBLIC_IP_LOOKUP=0 ;;
-    --health-file|--disk-path)
+    --disk-path)
       (( $# >= 2 )) || { printf 'Argument missing for %s\n' "$1" >&2; exit 64; }
-      if [[ $1 == --health-file ]]; then HEALTH_FILE=$2; else DISK_PATH=$2; fi
+      DISK_PATH=$2
       shift ;;
     --help|-h) usage; exit 0 ;;
     *) printf 'Unknown argument: %s\n' "$1" >&2; usage >&2; exit 64 ;;
@@ -298,7 +291,6 @@ if [[ $CONTAINER == yes ]]; then warn 'Dalam container: load average biasanya mi
 : > "$TMP/php-after"; : > "$TMP/node-after"; : > "$TMP/nvm-after"
 : > "$TMP/services-before"; : > "$TMP/services-after"
 : > "$TMP/node-apps-before"; : > "$TMP/node-apps-after"
-: > "$TMP/health-before"; : > "$TMP/health-after"
 : > "$TMP/restart-results"
 : > "$TMP/packages-before"; : > "$TMP/packages-after"; : > "$TMP/packages-changed"
 : > "$TMP/pm2-before"; : > "$TMP/pm2-after"
@@ -442,36 +434,20 @@ services_inventory() {
     while IFS= read -r unit; do
       printf '%s|%s\n' "$unit" "$(systemctl is-active "$unit" 2>/dev/null || echo unknown)"
     done > "$target" || true
+  # Include custom PHP worker services (for example artisan queue workers).
+  local php_pid php_user php_cmd php_unit
+  while IFS=' ' read -r php_pid php_user php_cmd; do
+    [[ $php_pid =~ ^[0-9]+$ && $php_cmd =~ ^php([0-9.]+)?$ ]] || continue
+    php_unit=$(service_for_pid "$php_pid")
+    [[ $php_unit == *.service ]] || continue
+    printf '%s|%s\n' "$php_unit" "$(systemctl is-active "$php_unit" 2>/dev/null || echo unknown)" >> "$target"
+  done < <(ps -eo pid=,user=,comm= -ww 2>/dev/null || true)
   # Also collect custom systemd Node units, where visible through process cgroups.
   while IFS='|' read -r manager user name status pid exe; do
     [[ $manager == systemd && $name == *.service ]] || continue
     printf '%s|%s\n' "$name" "$(systemctl is-active "$name" 2>/dev/null || echo unknown)" >> "$target"
   done < "$TMP/node-apps-before"
   sort -u "$target" -o "$target"
-}
-
-health_check() {
-  local target=$1 tries=$2 name url expected got i
-  : > "$target"
-  [[ -f $HEALTH_FILE ]] || { warn "HTTP health belum dikonfigurasi ($HEALTH_FILE). Status proses bukan bukti aplikasi sehat."; return; }
-  if ! command -v curl >/dev/null 2>&1; then warn 'curl tidak tersedia untuk HTTP health check'; return; fi
-  while IFS='|' read -r name url expected extra; do
-    [[ -z $name || $name == \#* ]] && continue
-    expected=${expected:-200}; got=000
-    if [[ ! $name =~ ^[A-Za-z0-9_.-]+$ || ! $url =~ ^https?:// || ! $expected =~ ^[1-5][0-9][0-9]$ || -n ${extra:-} ]]; then
-      err "Health config invalid untuk entry: ${name:0:60}"
-      printf '%s|INVALID\n' "$name" >> "$target"
-      continue
-    fi
-    HAVE_HEALTH=1
-    for ((i=1; i<=tries; i++)); do
-      got=$(curl -fsS -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 5 "$url" 2>/dev/null || true)
-      [[ $got == "$expected" ]] && break
-      ((i<tries)) && sleep 2
-    done
-    if [[ $got == "$expected" ]]; then ok "Health $name: HTTP $got"; printf '%s|PASS\n' "$name" >> "$target"
-    else err "Health $name: expected HTTP $expected, received ${got:-000}"; printf '%s|FAIL\n' "$name" >> "$target"; fi
-  done < "$HEALTH_FILE"
 }
 
 show_runtime() {
@@ -522,14 +498,12 @@ if command -v docker >/dev/null 2>&1 && [[ $CONTAINER == no ]]; then
   docker ps --format '  container={{.Names}} image={{.Image}} status={{.Status}}' 2>/dev/null || true
 fi
 
-section 'HEALTH CHECK SEBELUM PERUBAHAN'
-health_check "$TMP/health-before" 1
-BASE_HEALTH_FAIL=$ERRORS
+section 'BASELINE SERVICE / PROSES'
+log 'Baseline dicatat otomatis dari systemd, PM2, dan proses Node.js.'
+log 'Tidak perlu konfigurasi tambahan. Status proses saja tidak menjamin fungsi API/DB/queue.'
 
 if [[ $MODE == apply ]]; then
   if [[ $ERRORS -ne 0 ]]; then err 'Baseline bermasalah; upgrade dibatalkan'; APPLY_ABORTED=1
-  elif ((HAVE_HEALTH==0 && ALLOW_UNVERIFIED==0)); then
-    err 'Upgrade dibatalkan: buat --health-file, atau gunakan --allow-unverified dengan sadar.'; APPLY_ABORTED=1
   elif (( $(df -Pk / | awk 'NR==2 {print $4}') < 1048576 )); then
     err 'Free disk / < 1 GiB. Upgrade dibatalkan.'; APPLY_ABORTED=1
   elif command -v fuser >/dev/null 2>&1 && fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then
@@ -538,7 +512,6 @@ if [[ $MODE == apply ]]; then
   if ((APPLY_ABORTED==0)); then
     section 'APT UPDATE DAN UPGRADE (OUTPUT LANGSUNG)'
     if [[ $CONTAINER == yes ]]; then warn 'Container APT mode enabled; no automatic service restarts in container'; fi
-    if ((HAVE_HEALTH==0)); then warn 'Proceeding without application HTTP checks (--allow-unverified)'; fi
     if [[ -r /var/lib/dpkg/status ]]; then
       dpkg-query -W -f='${binary:Package}\t${Version}\n' > "$TMP/packages-before" 2>/dev/null || true
     fi
@@ -657,10 +630,6 @@ if [[ $MODE == apply && $APT_RAN -eq 1 && $RESTART -eq 1 && $CONTAINER == no ]];
     if systemctl try-restart "$unit" && systemctl is-active --quiet "$unit"; then
       ok "$unit: active setelah restart"; restart_record "$unit" OK active
     else err "$unit: restart gagal"; restart_record "$unit" FAIL restart; RESTART_FAILED=1; break; fi
-    if ((HAVE_HEALTH)); then
-      before_err=$ERRORS; health_check "$TMP/health-intermediate" 3
-      if ((ERRORS>before_err)); then err "Health menurun setelah $unit, restart berikutnya dihentikan"; RESTART_FAILED=1; break; fi
-    fi
   done < "$TMP/restart-candidates"
 
   # PM2 only for apps whose live Node executable WAS apt-managed (/usr/bin/node).
@@ -676,10 +645,6 @@ if [[ $MODE == apply && $APT_RAN -eq 1 && $RESTART -eq 1 && $CONTAINER == no ]];
       if timeout 60 runuser -u "$user" -- env HOME="$home" PM2_HOME="$home/.pm2" PATH="$(dirname "$bin"):$PATH" "$bin" reload "$id"; then
         ok "PM2 $user/$name: reload selesai"; restart_record "pm2:$user/$name" OK online
       else err "PM2 $user/$name: gagal"; restart_record "pm2:$user/$name" FAIL reload; RESTART_FAILED=1; break; fi
-      if ((HAVE_HEALTH)); then
-        before_err=$ERRORS; health_check "$TMP/health-intermediate" 3
-        if ((ERRORS>before_err)); then err 'Health menurun setelah reload PM2'; RESTART_FAILED=1; break; fi
-      fi
     done < "$TMP/pm2-before"
   fi
   [[ -s $TMP/restart-results ]] || log 'Tidak ada restart yang diperlukan / terverifikasi aman.'
@@ -718,7 +683,60 @@ if [[ $CONTAINER == no && -x $(command -v systemctl || echo /no/such/file) ]]; t
     if [[ $after == active ]]; then ok "Service $unit: active"; else err "Service $unit: $before -> $after"; fi
   done < "$TMP/services-before"
 fi
-health_check "$TMP/health-after" 3
+
+# Compare the application inventory from before maintenance. We explicitly check
+# process/service liveness only: without app-specific probes, functional health
+# (database access, endpoints, queue throughput) cannot be guaranteed.
+section 'VALIDASI APLIKASI (TANPA FILE KONFIGURASI)'
+APP_OK=0
+APP_FAIL=0
+APP_UNVERIFIED=0
+while IFS='|' read -r user name before pid id bin; do
+  [[ -n $user ]] || continue
+  if [[ $before == online ]]; then
+    after=$(awk -F '|' -v u="$user" -v id="$id" '$1==u && $5==id {print $3;exit}' "$TMP/pm2-after")
+    if [[ $after == online ]]; then
+      ok "PM2 $user/$name: online setelah pemeriksaan"
+      APP_OK=$((APP_OK+1))
+    else
+      err "PM2 $user/$name: sebelumnya online, sekarang ${after:-tidak ditemukan}"
+      APP_FAIL=$((APP_FAIL+1))
+    fi
+  else
+    log "PM2 $user/$name: status awal $before (tidak diasumsikan sehat)"
+    APP_UNVERIFIED=$((APP_UNVERIFIED+1))
+  fi
+done < "$TMP/pm2-before"
+# Count Node systemd services once per unit, even if multiple worker PIDs exist.
+while IFS='|' read -r user name before; do
+  [[ -n $name ]] || continue
+  if [[ $before == active ]]; then
+    after=$(awk -F '|' -v u="$user" -v n="$name" '$1=="systemd" && $2==u && $3==n {print $4;exit}' "$TMP/node-apps-after")
+    if [[ $after == active ]]; then
+      ok "Node systemd $name: active dan proses Node terdeteksi"
+      APP_OK=$((APP_OK+1))
+    else
+      err "Node systemd $name: sebelumnya active, sekarang ${after:-proses tidak terdeteksi}"
+      APP_FAIL=$((APP_FAIL+1))
+    fi
+  else
+    log "Node systemd $name: status awal $before (tidak diasumsikan sehat)"
+    APP_UNVERIFIED=$((APP_UNVERIFIED+1))
+  fi
+done < <(awk -F '|' '$1=="systemd" {k=$2 FS $3; if (!seen[k]++) print $2 "|" $3 "|" $4}' "$TMP/node-apps-before")
+while IFS='|' read -r manager user name before pid exe; do
+  [[ $manager == process ]] || continue
+  # Exclude PM2-managed PIDs, which are checked above.
+  if [[ -s $TMP/pm2-before ]] && awk -F '|' -v p="$pid" '$4==p {found=1} END {exit !found}' "$TMP/pm2-before"; then continue; fi
+  if awk -F '|' -v u="$user" -v n="$name" '$1=="process" && $2==u && $3==n {found=1} END {exit !found}' "$TMP/node-apps-after"; then
+    ok "Node process $user/$name: proses masih terdeteksi"
+    APP_OK=$((APP_OK+1))
+  else
+    err "Node process $user/$name: proses tidak ditemukan lagi"
+    APP_FAIL=$((APP_FAIL+1))
+  fi
+done < "$TMP/node-apps-before"
+log "Validasi proses: $APP_OK aktif / $APP_FAIL gagal / $APP_UNVERIFIED tidak terverifikasi; HTTP tidak diperiksa."
 
 section 'RINGKASAN AKHIR — COPY/PASTE'
 primary_version() {
@@ -733,8 +751,6 @@ CURRENT_NODE_PATH=$(command -v node 2>/dev/null || echo /usr/bin/node)
 NODE_OLD=$(primary_version "$TMP/node-before" "$CURRENT_NODE_PATH")
 NODE_NEW=$(primary_version "$TMP/node-after" "$CURRENT_NODE_PATH")
 NODE_APPS_COUNT=0
-HEALTH_PASS=$(grep -c '|PASS$' "$TMP/health-after" || true)
-HEALTH_FAIL=$(grep -Ec '\|(FAIL|INVALID)$' "$TMP/health-after" || true)
 RESTART_OK=$(grep -c '|OK|' "$TMP/restart-results" || true)
 RESTART_FAIL=$(grep -c '|FAIL|' "$TMP/restart-results" || true)
 printf 'Hostname          : %s\n' "$(hostname)"
@@ -765,14 +781,14 @@ if [[ -s $TMP/node-apps-after ]]; then
 fi
 ((NODE_APPS_COUNT>0)) || printf '  (tidak ditemukan / akses terbatas / ada di Docker/Kubernetes)\n'
 printf 'Node app terdeteksi: %s (best-effort, bukan inventaris lengkap)\n' "$NODE_APPS_COUNT"
-printf 'HTTP health       : %s PASS / %s FAIL (hanya endpoint terdaftar)\n' "$HEALTH_PASS" "$HEALTH_FAIL"
+printf 'Status aplikasi    : %s aktif / %s gagal / %s unverified (proses saja)\n' "$APP_OK" "$APP_FAIL" "$APP_UNVERIFIED"
 printf 'Restart terkait   : %s OK / %s FAIL\n' "$RESTART_OK" "$RESTART_FAIL"
 if [[ -f /run/reboot-required ]]; then warn 'Server memerlukan reboot (tidak dilakukan otomatis)'; fi
 if ((ERRORS>0 || APPLY_ABORTED==1)); then RESULT='FAIL'
-elif ((WARN>0 || HAVE_HEALTH==0)); then RESULT='REVIEW'
+elif ((WARN>0 || APP_UNVERIFIED>0)); then RESULT='REVIEW'
 else RESULT='PASS'; fi
 printf 'PERINGATAN        : %s | ERROR: %s\n' "$WARN" "$ERRORS"
 printf 'HASIL             : %s\n' "$RESULT"
-log 'Keterangan: active/online berarti proses hidup; hanya HTTP health yang memverifikasi endpoint.'
+log 'Keterangan: active/online hanya memastikan proses berjalan; fungsi HTTP/DB/queue tidak diuji.'
 log 'Tidak ada log/JSON diunggah atau disimpan permanen oleh skrip.'
 if [[ $RESULT == FAIL ]]; then exit 2; fi
