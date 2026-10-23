@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-SCRIPT_VERSION='0.3.4'
+SCRIPT_VERSION='0.4.0'
 MODE='audit'
 ALLOW_CONTAINER=0
 UPDATE_NVM=0
@@ -29,22 +29,33 @@ RESTART_FAILED=0
 PM2_DISCOVERED=0
 APPLY_ABORTED=0
 NVM_PRESENT=0
+NODE_LTS=0
+AUTO_LTS=1
+NODE_LTS_MAJOR=24
+PHP_STABLE_SERIES='8.5'
+PHP_MIGRATED=0
+NODE_LTS_SKIPPED=0
+NODE_SOURCE_FILE=''
+NODE_SOURCE_BACKUP=''
+NODE_SOURCE_SWITCHED=0
+NODE_MAJOR_INSTALLED=0
 
 usage() {
 cat <<'HELP'
-Ubuntu Maintenance v0.3.4 — terminal-only (no report upload or saved logs)
+Ubuntu Maintenance v0.4.0 — terminal-only (no report upload or saved logs)
 
   bash ubuntu-maintenance-v03.sh --audit             # regular user or root
   sudo bash ubuntu-maintenance-v03.sh --audit        # fuller host inventory
-  sudo bash ubuntu-maintenance-v03.sh --apply        # apt upgrade + targeted restart
   bash ubuntu-maintenance-v03.sh --demo              # simulated terminal view
+  sudo bash ubuntu-maintenance-v03.sh --apply        # update + stable runtime migration where safe
 
 Options:
   --audit                 Read-only inventory (default), supports non-root/container
-  --apply                 apt-get update && apt-get upgrade (Ubuntu, root only)
+  --apply                 APT upgrade + auto stable PHP/Node where safe (Ubuntu, root)
   --allow-container-apply Explicitly permit APT inside container (no auto restarts)
-  --update-nvm            Update NVM default Node within its existing major (root, opt-in)
-  --no-restart            Do not automatically restart affected services/PM2 apps
+  --update-nvm            Update NVM default within its existing major (optional)
+  --node-lts              Require an eligible NodeSource path to Node 24 LTS (strict mode)
+  --no-restart            Do not automatically restart active PHP-FPM/PM2 and affected services
   --no-public-ip          Never contact an external IP lookup endpoint
   --disk-path PATH        Filesystem to report (default /)
   --demo                  Simulated, fictional output; no system operations
@@ -52,7 +63,9 @@ Options:
 
 Important:
 * APT updates installed Ubuntu-managed PHP/Node packages, NOT NVM/asdf/fnm,
-  Docker images, or binaries installed manually. Major version changes require review.
+  Docker images, or binaries installed manually. PHP 8.5 requires an existing compatible APT repository; the script never silently adds a PPA.
+* Node 24 LTS migration is automatic only for managed NodeSource installs without unmanaged Node processes.
+* PHP 8.5 CLI migration runs only for CLI-only installs with matching modules; existing PHP-FPM virtual hosts are never automatically rewired.
 * Apply needs no configuration file; post-upgrade verification checks process/systemd/PM2 status, not HTTP functionality.
 * No automatic reboot, rollback, or container orchestration actions.
 * apt-get itself can restart services before our controlled restart phase.
@@ -63,7 +76,7 @@ HELP
 demo() {
 cat <<'DEMO'
 ╔════════════════════════════════════════════════════════════════════╗
-║  UBUNTU MAINTENANCE v0.3.4 • SIMULASI (BUKAN HASIL SERVER ASLI)   ║
+║  UBUNTU MAINTENANCE v0.4.0 • SIMULASI (BUKAN HASIL SERVER ASLI)   ║
 ╚════════════════════════════════════════════════════════════════════╝
 [15:08:21] Mode              : APPLY
 [15:08:21] Hostname          : prod-api-01
@@ -73,7 +86,7 @@ cat <<'DEMO'
 [15:08:21] Lingkungan        : Host / VM
 [15:08:21] IP lokal          : 192.168.10.20
 [15:08:21] IP publik (egress): 203.0.113.20
-[15:08:21] CPU               : 12.8% terpakai | 8 vCPU | load 0.64 / 0.71 / 0.83
+[15:08:21] CPU               : 12.8% terpakai | 8 vCPU
 [15:08:21] RAM               : 3.20 GiB terpakai / 8.00 GiB total (4.80 GiB available)
 [15:08:21] Disk /            : 42.00 GiB terpakai / 100.00 GiB total (58.00 GiB free)
 
@@ -91,6 +104,8 @@ cat <<'DEMO'
 ──── [03] PEMBARUAN PAKET ────
 [15:08:25] Apt Update   [done]
 [15:08:36] Apt Upgrade  [done]
+[15:08:44] PHP 8.5 CLI       [done]
+[15:08:50] Node 24 LTS       [done]
 
 ──── [04] RESTART TERARAH ────
 [15:08:58] ✓ php8.3-fpm.service : restart berhasil; active
@@ -119,6 +134,7 @@ while (( $# > 0 )); do
     --demo) demo; exit 0 ;;
     --allow-container-apply) ALLOW_CONTAINER=1 ;;
     --update-nvm) UPDATE_NVM=1 ;;
+    --node-lts) NODE_LTS=1; AUTO_LTS=0 ;;
     --no-restart) RESTART=0 ;;
     --no-public-ip) PUBLIC_IP_LOOKUP=0 ;;
     --disk-path)
@@ -130,6 +146,10 @@ while (( $# > 0 )); do
   esac
   shift
 done
+if ((NODE_LTS)) && [[ $MODE != apply ]]; then
+  printf '%s\n' '--node-lts requires --apply' >&2
+  exit 64
+fi
 if ((UPDATE_NVM)) && [[ $MODE != apply ]]; then
   printf '%s\n' '--update-nvm requires --apply' >&2
   exit 64
@@ -149,6 +169,9 @@ section() { STEP=$((STEP+1)); printf '\n%s──── [%02d] %s ────%s\
 cleanup() {
   local rc=$?
   trap - EXIT
+  if (( NODE_SOURCE_SWITCHED == 1 && NODE_MAJOR_INSTALLED == 0 )) && [[ -n $NODE_SOURCE_FILE && -f $NODE_SOURCE_BACKUP ]]; then
+    cp -p -- "$NODE_SOURCE_BACKUP" "$NODE_SOURCE_FILE" || printf 'WARNING: failed restoring NodeSource repository %s\n' "$NODE_SOURCE_FILE" >&2
+  fi
   if [[ -n $TMP && -d $TMP ]]; then rm -rf -- "$TMP"; fi
   exit "$rc"
 }
@@ -277,7 +300,7 @@ log "Pengguna efektif  : $EXEC_USER $( ((EUID==0)) && [[ $ORIGINAL_USER != root 
 log "Lingkungan        : $([[ $CONTAINER == yes ]] && echo Container || echo 'Host / VM')"
 log "IP lokal          : $LOCAL_IP"
 log "IP publik (egress): $PUBLIC_IP"
-log "CPU               : $CPU_USED% terpakai ($CPU_VIEW) | $CPU_CORES logical CPU | load 1/5/15: $LOADAVG"
+log "CPU               : $CPU_USED% terpakai ($CPU_VIEW) | $CPU_CORES logical CPU"
 log "RAM               : $(gib "$MEM_USED") GiB terpakai / $(gib "$MEM_TOTAL") GiB total ($(gib "$MEM_AVAIL") GiB available, $MEM_SCOPE)"
 log "Disk $DISK_PATH            : $(gib "$DISK_USED") GiB terpakai / $(gib "$DISK_TOTAL") GiB total ($(gib "$DISK_AVAIL") GiB free, $DISK_PC used)"
 [[ $PUBLIC_IP != unavailable || $PUBLIC_IP_LOOKUP -eq 0 ]] || warn 'IP publik tidak dapat diperoleh; lanjut tanpa IP publik.'
@@ -455,53 +478,45 @@ show_runtime() {
     ok "$label  $path : $ver"
     count=$((count+1))
   done < "$target"
-  (( count>0 )) || log "$label: tidak ditemukan pada path host standar"
+  (( count>0 )) || log "$label: N/A"
 }
 
-# Quiet command runner for human-friendly terminal output.
-# Full machine output is captured temporarily and only summarized on failure.
+# Quiet command runner: never show raw APT output on success.
+# On a real terminal, redraw ONE short spinner line. In pipes/log captures,
+# show only the final result, never a frame for every tick.
 run_quiet() {
   local description=$1; shift
-  local slug logfile rc lastline index=0
+  local slug logfile rc index=0 pid lastline
   local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
   slug=$(printf '%s' "$description" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-')
   logfile="$TMP/${slug:-step}.log"
   : > "$logfile"
-
-  if [[ -t 1 ]]; then
-    printf '[%s] %s ' "$(date '+%H:%M:%S')" "$description"
+  if [[ -t 1 && -z ${CI:-} && ${TERM:-dumb} != dumb ]]; then
     "$@" >"$logfile" 2>&1 &
-    local pid=$!
+    pid=$!
     while kill -0 "$pid" 2>/dev/null; do
-      printf '
-[%s] %s %s' "$(date '+%H:%M:%S')" "$description" "${frames[index%10]}"
+      # \\033[2K wipes the whole line, including remnants of earlier frames.
+      printf '\r\033[2K  %s %s' "${frames[index%10]}" "$description"
       index=$((index+1))
-      sleep 0.12
+      sleep 0.24
     done
-    wait "$pid"; rc=$?
-    if (( rc == 0 )); then
-      printf '
-[%s] %-44s %b[done]%b\n' "$(date '+%H:%M:%S')" "$description" "$GREEN" "$RESET"
-      return 0
-    fi
-    printf '
-[%s] %-44s %b[failed]%b\n' "$(date '+%H:%M:%S')" "$description" "$RED" "$RESET"
+    if wait "$pid"; then rc=0; else rc=$?; fi
+    printf '\r\033[2K'
   else
-    if "$@" >"$logfile" 2>&1; then
-      printf '[%s] %-44s [done]\n' "$(date '+%H:%M:%S')" "$description"
-      return 0
-    fi
-    rc=$?
-    printf '[%s] %-44s [failed]\n' "$(date '+%H:%M:%S')" "$description"
+    if "$@" >"$logfile" 2>&1; then rc=0; else rc=$?; fi
   fi
-
+  if (( rc == 0 )); then
+    printf '[%s] %-23s %b[done]%b\n' "$(date '+%H:%M:%S')" "$description" "$GREEN" "$RESET"
+    return 0
+  fi
+  printf '[%s] %-23s %b[failed]%b\n' "$(date '+%H:%M:%S')" "$description" "$RED" "$RESET"
   lastline=$(awk 'NF{line=$0} END{print line}' "$logfile" 2>/dev/null || true)
   if [[ -n $lastline ]]; then
-    err "$description gagal: ${lastline:0:220}"
+    err "$description: ${lastline:0:220} (exit $rc)"
   else
-    err "$description gagal tanpa pesan output."
+    err "$description gagal tanpa detail dari program (exit $rc)."
   fi
-  return $rc
+  return "$rc"
 }
 
 section 'RUNTIME AWAL (PHP / NODE / NVM)'
@@ -535,12 +550,130 @@ section 'BASELINE SERVICE / PROSES'
 log 'Baseline dicatat otomatis dari systemd, PM2, dan proses Node.js.'
 log 'Tidak perlu konfigurasi tambahan. Status proses saja tidak menjamin fungsi API/DB/queue.'
 
+# Deliberate NodeSource migration, never triggered by plain --apply.
+# Only modify the single recognized NodeSource APT source (its signing key stays unchanged).
+prepare_nodesource_lts() {
+  local candidate file source_count=0 mgr user name status pid exe old_major new_content
+  command -v dpkg-query >/dev/null 2>&1 || { err 'dpkg-query tidak tersedia.'; return 1; }
+  [[ -x /usr/bin/node ]] || { err '--node-lts memerlukan instalasi Node.js sistem di /usr/bin/node.'; return 1; }
+  candidate=$(dpkg-query -W -f='${Version}' nodejs 2>/dev/null || true)
+  [[ -n $candidate ]] || { err '--node-lts hanya mendukung Node.js paket APT/NodeSource.'; return 1; }
+  old_major=$(/usr/bin/node -p 'process.versions.node.split(".")[0]' 2>/dev/null || true)
+  [[ $old_major =~ ^[0-9]+$ ]] || { err 'Versi Node sistem tidak dapat diperiksa.'; return 1; }
+  if (( old_major > NODE_LTS_MAJOR )); then
+    err "Node $old_major lebih baru daripada LTS $NODE_LTS_MAJOR; tidak melakukan downgrade otomatis."
+    return 1
+  fi
+  if [[ $old_major == "$NODE_LTS_MAJOR" ]]; then
+    log "Node.js sudah di cabang LTS $NODE_LTS_MAJOR.x. Upgrade patch tetap melalui APT."
+    return 0
+  fi
+  # Never interrupt bare processes with unknown restart mechanisms.
+  while IFS='|' read -r mgr user name status pid exe; do
+    [[ $mgr == process && $exe == /usr/bin/node* ]] || continue
+    if [[ -s $TMP/pm2-before ]] && awk -F '|' -v p="$pid" '$4==p {f=1} END{exit !f}' "$TMP/pm2-before"; then continue; fi
+    err "Node LTS ditolak: $user/$name (PID $pid) belum punya pengelola restart teridentifikasi. Migrasi manual diperlukan."
+    return 1
+  done < "$TMP/node-apps-before"
+  for file in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+    [[ -f $file ]] || continue
+    if grep -Eq 'deb\.nodesource\.com/node_[0-9]+\.x' "$file"; then
+      NODE_SOURCE_FILE=$file
+      source_count=$((source_count+1))
+    fi
+  done
+  if ((source_count != 1)); then
+    err "Ditemukan $source_count file repository NodeSource; diharapkan tepat satu. Tidak diubah otomatis."
+    return 1
+  fi
+  if [[ ! -w $NODE_SOURCE_FILE ]]; then err "Source APT tidak dapat ditulis: $NODE_SOURCE_FILE"; return 1; fi
+  NODE_SOURCE_BACKUP="$TMP/nodesource.original"
+  cp -p -- "$NODE_SOURCE_FILE" "$NODE_SOURCE_BACKUP"
+  sed -E "s|https?://deb\\.nodesource\\.com/node_[0-9]+\\.x|https://deb.nodesource.com/node_${NODE_LTS_MAJOR}.x|g" "$NODE_SOURCE_BACKUP" > "$TMP/nodesource.updated"
+  if cmp -s "$TMP/nodesource.updated" "$NODE_SOURCE_BACKUP"; then
+    err 'Repository NodeSource tidak berubah; format tidak dikenal.'
+    return 1
+  fi
+  cat "$TMP/nodesource.updated" > "$NODE_SOURCE_FILE"
+  NODE_SOURCE_SWITCHED=1
+  log "NodeSource: cabang $old_major.x → $NODE_LTS_MAJOR.x (LTS; migrasi mayor eksplisit)."
+}
+
+node_lts_install() {
+  local candidate major rc
+  candidate=$(awk '$1=="Candidate:" {print $2}' "$TMP/node-apt-policy")
+  major=$(printf '%s\n' "${candidate#*:}" | awk -F'.' '$1~/^[0-9]+$/ {print $1}')
+  if [[ $major != "$NODE_LTS_MAJOR" ]]; then
+    err "NodeSource tidak menyediakan kandidat $NODE_LTS_MAJOR.x ($candidate). Repository akan dipulihkan."
+    return 1
+  fi
+  if ! env DEBIAN_FRONTEND=noninteractive apt-get -s install nodejs > "$TMP/node-install-plan" 2>&1; then
+    err 'Simulasi instalasi Node LTS gagal. Repository akan dipulihkan.'
+    return 1
+  fi
+  if grep -q '^Remv ' "$TMP/node-install-plan"; then
+    err 'Simulasi migrasi Node menunjukkan penghapusan paket lain; upgrade dibatalkan.'
+    return 1
+  fi
+  # From this point dpkg may change the installed major; never restore the old repo blindly.
+  NODE_MAJOR_INSTALLED=1
+  if ! run_quiet 'Node LTS Upgrade' env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none NEEDRESTART_MODE=l apt-get -qq -o DPkg::Lock::Timeout=60 -o Dpkg::Options::=--force-confold -y --only-upgrade install nodejs; then
+    return 1
+  fi
+  major=$(/usr/bin/node -p 'process.versions.node.split(".")[0]' 2>/dev/null || true)
+  if [[ $major != "$NODE_LTS_MAJOR" ]]; then
+    err "Node.js sesudah instalasi bukan $NODE_LTS_MAJOR.x; periksa paket yang terpasang."
+    NODE_MAJOR_INSTALLED=1  # leave new repository in place if package state is uncertain
+    return 1
+  fi
+  NODE_MAJOR_INSTALLED=1
+  ok "Node.js LTS $NODE_LTS_MAJOR.x terpasang."
+}
+
 if [[ $MODE == apply ]]; then
   if [[ $ERRORS -ne 0 ]]; then err 'Baseline bermasalah; upgrade dibatalkan'; APPLY_ABORTED=1
   elif (( $(df -Pk / | awk 'NR==2 {print $4}') < 1048576 )); then
     err 'Free disk / < 1 GiB. Upgrade dibatalkan.'; APPLY_ABORTED=1
   elif command -v fuser >/dev/null 2>&1 && fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then
     err 'APT/dpkg lock sedang digunakan. Upgrade dibatalkan.'; APPLY_ABORTED=1
+  fi
+  if ((APPLY_ABORTED==0)); then
+    # Default --apply attempts the latest production LTS only for existing
+    # NodeSource-managed installations with a clearly restartable workload.
+    if ((NODE_LTS==0 && AUTO_LTS==1)) && [[ -x /usr/bin/node ]] &&
+       dpkg-query -W -f='${Status}' nodejs 2>/dev/null | grep -q '^install ok installed$'; then
+      if [[ -n $(grep -El 'deb\.nodesource\.com/node_[0-9]+\.x' /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true) ]]; then
+        NODE_LTS=1
+      else
+        major_now=$(/usr/bin/node -p 'process.versions.node.split(".")[0]' 2>/dev/null || true)
+        if [[ $major_now != "$NODE_LTS_MAJOR" ]]; then
+          warn "Node $major_now.x tidak menggunakan repository NodeSource yang dikenali; migrasi LTS otomatis dilewati."
+          NODE_LTS_SKIPPED=1
+        fi
+      fi
+    fi
+    if ((NODE_LTS==1)); then
+      # A bare Node process may run under screen/nohup and cannot be restarted
+      # reliably. Keep same-major APT maintenance available in that situation.
+      unmanaged=0
+      while IFS='|' read -r mgr u app state pid exe; do
+        [[ $mgr == process && $exe == /usr/bin/node* ]] || continue
+        if [[ -s $TMP/pm2-before ]] && awk -F '|' -v p="$pid" '$4==p{found=1} END{exit !found}' "$TMP/pm2-before"; then continue; fi
+        unmanaged=1
+        warn "Node LTS: $u/$app (PID $pid) tidak dikelola supervisor yang dapat direstart; migrasi major dilewati."
+      done < "$TMP/node-apps-before"
+      if ((unmanaged==1 && AUTO_LTS==1)); then NODE_LTS=0; NODE_LTS_SKIPPED=1; fi
+    fi
+    if ((NODE_LTS==1)); then
+      if ! prepare_nodesource_lts; then
+        if ((AUTO_LTS==1)); then
+          warn 'Migrasi NodeSource tidak tersedia. Upgrade APT reguler dilanjutkan.'
+          NODE_LTS=0; NODE_LTS_SKIPPED=1
+        else
+          APPLY_ABORTED=1
+        fi
+      fi
+    fi
   fi
   if ((APPLY_ABORTED==0)); then
     section 'APT UPDATE DAN UPGRADE'
@@ -580,13 +713,17 @@ if [[ $MODE == apply ]]; then
       fi
       log "Node APT: $installed -> $candidate (major $installed_major -> $candidate_major)"
       if [[ $installed_major != "$candidate_major" ]]; then
-        err "Node APT kandidat major berbeda ($installed -> $candidate). Upgrade dibatalkan; review repo dahulu."
-        return 1
+        if ((NODE_LTS == 1)) && [[ $candidate_major == "$NODE_LTS_MAJOR" ]]; then
+          log "Node LTS: major $installed_major.x → $candidate_major.x diizinkan oleh --node-lts."
+        else
+          err "Node APT kandidat major berbeda ($installed -> $candidate). Upgrade dibatalkan; review repo dahulu."
+          return 1
+        fi
       fi
       return 0
     }
     if run_quiet 'Apt Update' env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none NEEDRESTART_MODE=l apt-get -qq -o DPkg::Lock::Timeout=60 update; then
-      if node_apt_major_check; then
+      if node_apt_major_check && { ((NODE_LTS==0)) || node_lts_install; }; then
         if run_quiet 'Apt Upgrade' env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none NEEDRESTART_MODE=l apt-get -qq -o DPkg::Lock::Timeout=60 -o Dpkg::Options::=--force-confold -y upgrade; then
           APT_RAN=1
         else
@@ -611,6 +748,119 @@ if [[ $MODE == apply ]]; then
 else
   section 'MODE AUDIT: TANPA PERUBAHAN'
   ok 'Tidak menjalankan apt, mengubah versi runtime, atau restart aplikasi'
+fi
+
+# PHP latest stable: upgrade an existing CLI-only APT installation only when
+# PHP 8.5 is already available from configured/trusted repositories. We never
+# rewrite Nginx upstreams, Apache modules, or PHP-FPM pool/socket paths.
+php_stable_cli_upgrade() {
+  local oldver oldseries candidate oldmodules newmodules newbin oldbin oldreal pkg version wanted pkgname
+  oldbin=$(command -v php 2>/dev/null || true)
+  [[ -n $oldbin && -x $oldbin && -x /usr/bin/php ]] || return 0
+  oldreal=$(readlink -f /usr/bin/php 2>/dev/null || true)
+  oldver=$(/usr/bin/php -r 'echo PHP_VERSION;' 2>/dev/null || true)
+  [[ $oldver =~ ^[0-9]+\.[0-9]+\. ]] || { warn 'PHP tidak berasal dari CLI APT yang dikenali; major upgrade dilewati.'; return 0; }
+  oldseries=${oldver%.*}
+  if [[ $oldseries == "$PHP_STABLE_SERIES" ]]; then
+    log "PHP sudah di cabang $PHP_STABLE_SERIES; patch APT telah dijalankan."
+    return 0
+  fi
+  if [[ $(printf '%s\n%s\n' "$PHP_STABLE_SERIES" "$oldseries" | sort -V | tail -n 1) == "$oldseries" ]]; then
+    warn "PHP $oldver lebih baru daripada target stabil $PHP_STABLE_SERIES; tidak diturunkan otomatis."
+    return 0
+  fi
+  # Do not rewire sites, queues, and extension-dependent FPM pools automatically.
+  if grep -Eq '^php[0-9.]+-fpm\.service\|active$|^apache2\.service\|active$' "$TMP/services-before" ||
+      grep -Eq '^libapache2-mod-php' "$TMP/packages-before"; then
+    warn "PHP $oldver: upgrade major ke $PHP_STABLE_SERIES dilewati (PHP-FPM/Apache aktif atau mod_php). Perlu migrasi situs/socket dan ekstensi."
+    return 0
+  fi
+  if grep -Eq '^php[^|]*\|' "$TMP/services-before" ||
+     ps -eo comm= 2>/dev/null | grep -Eq '^php([0-9.]+)?$'; then
+    warn "PHP $oldver: ada worker/proses PHP berjalan; migrasi major CLI perlu review."
+    return 0
+  fi
+  if ! dpkg-query -W -f='${Status}' "php${oldseries}-cli" 2>/dev/null | grep -q '^install ok installed$'; then
+    warn 'PHP CLI bukan paket versi APT yang dikenali; tidak memaksakan upgrade.'
+    return 0
+  fi
+  if ! apt-cache policy "php${PHP_STABLE_SERIES}-cli" >"$TMP/php-target-policy" 2>/dev/null; then
+    warn "APT tidak menyediakan PHP $PHP_STABLE_SERIES; tidak menambahkan repository pihak ketiga."
+    return 0
+  fi
+  candidate=$(awk '$1=="Candidate:"{print $2}' "$TMP/php-target-policy")
+  if [[ -z $candidate || $candidate == '(none)' ]]; then
+    warn "PHP $PHP_STABLE_SERIES tidak ada di repository APT saat ini; upgrade major dilewati."
+    return 0
+  fi
+  # Map versioned modules to the equivalent candidate version. Missing
+  # extension packages cause a conservative skip, not partial migration.
+  local -a installs=("php${PHP_STABLE_SERIES}-cli")
+  while IFS= read -r pkgname; do
+    [[ -n $pkgname ]] || continue
+    wanted="php${PHP_STABLE_SERIES}-${pkgname#php${oldseries}-}"
+    if [[ $wanted == "php${PHP_STABLE_SERIES}-cli" || $wanted == "php${PHP_STABLE_SERIES}-common" ]]; then continue; fi
+    if [[ $wanted == *-fpm || $wanted == *-dev || $wanted == *-dbg || $wanted == *-phpdbg ]]; then
+      warn "PHP extension/component $pkgname membutuhkan review; major CLI tidak dipindahkan."
+      return 0
+    fi
+    candidate=$(apt-cache policy "$wanted" 2>/dev/null | awk '$1=="Candidate:" {print $2}')
+    if [[ -z $candidate || $candidate == '(none)' ]]; then
+      warn "PHP extension $pkgname tidak punya paket pengganti $wanted; upgrade major dilewati."
+      return 0
+    fi
+    installs+=("$wanted")
+  done < <(dpkg-query -W -f='${binary:Package}\n' "php${oldseries}-*" 2>/dev/null | grep -E "^php${oldseries//./\.}-" || true)
+  if ! apt-get -s install "${installs[@]}" >"$TMP/php-upgrade-plan" 2>&1 || grep -q '^Remv ' "$TMP/php-upgrade-plan"; then
+    warn "Rencana PHP $PHP_STABLE_SERIES memerlukan penghapusan paket atau gagal disimulasikan; dilewati."
+    return 0
+  fi
+  oldmodules=$(/usr/bin/php -m 2>/dev/null | sed -n '/^\[PHP Modules\]/,/^\[Zend Modules\]/{/^\[/d;/^$/d;p;}' | sort -u)
+  if ! run_quiet "PHP ${PHP_STABLE_SERIES} Install" env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none NEEDRESTART_MODE=l apt-get -qq -y install "${installs[@]}"; then
+    return 1
+  fi
+  newbin="/usr/bin/php${PHP_STABLE_SERIES}"
+  if [[ ! -x $newbin ]]; then err "Binary $newbin tidak ditemukan"; return 1; fi
+  # Installing a PHP release may automatically switch the default interpreter
+  # in update-alternatives auto mode. Restore it until module validation passes.
+  if [[ -n $oldreal && $oldreal != "$(readlink -f /usr/bin/php)" ]]; then
+    if update-alternatives --list php 2>/dev/null | grep -Fxq "$oldreal"; then
+      if ! run_quiet 'PHP Default Preserve' update-alternatives --set php "$oldreal"; then
+        err "Gagal mempertahankan PHP default lama ($oldreal)."; return 1
+      fi
+    else
+      err "Default PHP berubah setelah instalasi dan interpreter lama tidak ada di alternatives; perlu review manual."
+      return 1
+    fi
+  fi
+  newmodules=$($newbin -m 2>/dev/null | sed -n '/^\[PHP Modules\]/,/^\[Zend Modules\]/{/^\[/d;/^$/d;p;}' | sort -u)
+  if [[ -n $(comm -23 <(printf '%s\n' "$oldmodules") <(printf '%s\n' "$newmodules")) ]]; then
+    warn 'PHP baru belum memuat semua modul CLI lama; default CLI dipertahankan.'
+    return 0
+  fi
+  if [[ $(readlink -f /usr/bin/php) == "$newbin" ]]; then
+    PHP_MIGRATED=1
+    ok "PHP CLI $oldver → $($newbin -r 'echo PHP_VERSION;')"
+    return 0
+  fi
+  if [[ -L /usr/bin/php && $(readlink /usr/bin/php) == /etc/alternatives/php ]] &&
+     update-alternatives --query php >"$TMP/php-alternatives" 2>/dev/null &&
+     update-alternatives --list php 2>/dev/null | grep -Fxq "$newbin"; then
+    if run_quiet 'PHP CLI Switch' update-alternatives --set php "$newbin"; then
+      PHP_MIGRATED=1
+      ok "PHP CLI $oldver → $(php -r 'echo PHP_VERSION;' 2>/dev/null || echo '?')"
+    fi
+  else
+    warn 'PHP 8.5 terpasang tetapi default CLI tidak memakai update-alternatives; tidak mengubah symlink secara paksa.'
+  fi
+}
+
+if [[ $MODE == apply && $APT_RAN -eq 1 && $CONTAINER == no && -s $TMP/php-before ]]; then
+  section 'PHP STABLE AUTO UPGRADE'
+  if ! php_stable_cli_upgrade; then
+    APPLY_ABORTED=1
+    err 'Upgrade PHP CLI gagal; periksa status paket sebelum melanjutkan.'
+  fi
 fi
 
 # Optional NVM patch upgrade for user profiles with a resolvable default alias.
@@ -654,7 +904,7 @@ restart_record() { printf '%s|%s|%s\n' "$1" "$2" "$3" >> "$TMP/restart-results";
 if [[ $MODE == apply && $APT_RAN -eq 1 && $RESTART -eq 1 && $CONTAINER == no ]]; then
   section 'RESTART SERVICE YANG TERDAMPAK'
   : > "$TMP/restart-candidates"
-  if ((PHP_CHANGED)); then
+  if [[ -s $TMP/php-before ]] || grep -Eq '^php[0-9.]+-fpm\.service\|active$' "$TMP/services-before"; then
     awk -F '|' '$1 ~ /^php[0-9.]+-fpm\.service$/ {print $1}' "$TMP/services-before" >> "$TMP/restart-candidates"
     if grep -q '^libapache2-mod-php' "$TMP/packages-changed"; then
       printf 'apache2.service\n' >> "$TMP/restart-candidates"
@@ -681,25 +931,23 @@ if [[ $MODE == apply && $APT_RAN -eq 1 && $RESTART -eq 1 && $CONTAINER == no ]];
     [[ $unit =~ ^[A-Za-z0-9_.@-]+\.service$ ]] || continue
     status_before=$(awk -F '|' -v u="$unit" '$1==u{print $2;exit}' "$TMP/services-before")
     [[ $status_before == active ]] || { warn "$unit: skip (sebelum upgrade bukan active)"; restart_record "$unit" SKIP 'not previously active'; continue; }
-    if [[ $unit == nginx.service ]] && command -v nginx >/dev/null 2>&1 && ! nginx -t; then err "nginx -t gagal; skip restart $unit"; restart_record "$unit" FAIL config; RESTART_FAILED=1; break; fi
-    if [[ $unit == apache2.service ]] && command -v apache2ctl >/dev/null 2>&1 && ! apache2ctl configtest; then err "apache configtest gagal; skip restart $unit"; restart_record "$unit" FAIL config; RESTART_FAILED=1; break; fi
-    log "Restart $unit ..."
-    if systemctl try-restart "$unit" && systemctl is-active --quiet "$unit"; then
+    if [[ $unit == nginx.service ]] && command -v nginx >/dev/null 2>&1 && ! nginx -t >"$TMP/nginx-config.log" 2>&1; then err "nginx -t gagal; skip restart $unit"; restart_record "$unit" FAIL config; RESTART_FAILED=1; break; fi
+    if [[ $unit == apache2.service ]] && command -v apache2ctl >/dev/null 2>&1 && ! apache2ctl configtest >"$TMP/apache-config.log" 2>&1; then err "apache configtest gagal; skip restart $unit"; restart_record "$unit" FAIL config; RESTART_FAILED=1; break; fi
+    if run_quiet "Restart $unit" systemctl try-restart "$unit" && systemctl is-active --quiet "$unit"; then
       ok "$unit: active setelah restart"; restart_record "$unit" OK active
     else err "$unit: restart gagal"; restart_record "$unit" FAIL restart; RESTART_FAILED=1; break; fi
   done < "$TMP/restart-candidates"
 
-  # PM2 only for apps whose live Node executable WAS apt-managed (/usr/bin/node).
+  # Reload previously online PM2 apps after maintenance; retain user identity.
   # Never reload all apps, and don't wake stopped apps.
-  if ((NODE_CHANGED && RESTART_FAILED==0)) && [[ -s $TMP/pm2-before ]]; then
+  if ((RESTART_FAILED==0)) && [[ -s $TMP/pm2-before ]]; then
     while IFS='|' read -r user name status pid id bin; do
       [[ $status == online && $pid =~ ^[0-9]+$ && $id =~ ^[0-9]+$ ]] || continue
       exe=$(node_exe "$pid")
-      [[ $exe == /usr/bin/node* ]] || { warn "PM2 $user/$name tidak menggunakan Node APT: review/restart manual"; continue; }
+      [[ -n $exe ]] || { warn "PM2 $user/$name: path Node tidak ditemukan; restart dilewati"; continue; }
       home=$(getent passwd "$user" | cut -d: -f6)
       [[ -n $home && -x $bin ]] || continue
-      log "Reload PM2 $user/$name (id=$id) ..."
-      if timeout 60 runuser -u "$user" -- env HOME="$home" PM2_HOME="$home/.pm2" PATH="$(dirname "$bin"):$PATH" "$bin" reload "$id"; then
+      if run_quiet "PM2 Reload $user/$name" timeout 60 runuser -u "$user" -- env HOME="$home" PM2_HOME="$home/.pm2" PATH="$(dirname "$bin"):$PATH" "$bin" reload "$id"; then
         ok "PM2 $user/$name: reload selesai"; restart_record "pm2:$user/$name" OK online
       else err "PM2 $user/$name: gagal"; restart_record "pm2:$user/$name" FAIL reload; RESTART_FAILED=1; break; fi
     done < "$TMP/pm2-before"
@@ -727,6 +975,24 @@ version_snapshot "$TMP/node-after" node
 nvm_snapshot "$TMP/nvm-after"
 node_proc_inventory "$TMP/node-apps-after"
 pm2_inventory "$TMP/pm2-after" after
+if (( NODE_MAJOR_INSTALLED == 1 && NODE_CHANGED == 1 )) && [[ -s $TMP/pm2-before ]]; then
+  while IFS='|' read -r u app status pid id bin; do
+    [[ $status == online && $pid =~ ^[0-9]+$ ]] || continue
+    # Only check PM2 workloads that previously ran under system Node.
+    prior=$(node_exe "$pid")
+    [[ $prior == /usr/bin/node* ]] || continue
+    newpid=$(awk -F '|' -v user="$u" -v want="$id" '$1==user && $5==want{print $4;exit}' "$TMP/pm2-after")
+    [[ $newpid =~ ^[0-9]+$ && $newpid -gt 0 ]] || { err "PM2 $u/$app: PID pascamigrasi tidak ditemukan"; continue; }
+    liveexe=$(node_exe "$newpid")
+    livever=$("/proc/$newpid/exe" -p 'process.versions.node' 2>/dev/null || true)
+    live_major=${livever%%.*}
+    if [[ $live_major != "$NODE_LTS_MAJOR" ]]; then
+      err "PM2 $u/$app: runtime aktif ${livever:-N/A}, bukan Node $NODE_LTS_MAJOR LTS (binary: $liveexe)"
+    else
+      ok "PM2 $u/$app: proses memakai Node $livever"
+    fi
+  done < "$TMP/pm2-before"
+fi
 show_runtime "$TMP/php-after" 'PHP '
 show_runtime "$TMP/node-after" 'Node'
 if [[ -s $TMP/nvm-after ]]; then
@@ -734,10 +1000,10 @@ if [[ -s $TMP/nvm-after ]]; then
 fi
 if (( EUID==0 )); then
   if command -v nginx >/dev/null 2>&1; then
-    if nginx -t 2>&1; then ok 'nginx config valid'; else err 'nginx config invalid'; fi
+    if nginx -t >"$TMP/nginx-config.log" 2>&1; then ok 'nginx config valid'; else err 'nginx config invalid'; fi
   fi
   if command -v apache2ctl >/dev/null 2>&1; then
-    if apache2ctl configtest 2>&1; then ok 'Apache config valid'; else err 'Apache config invalid'; fi
+    if apache2ctl configtest >"$TMP/apache-config.log" 2>&1; then ok 'Apache config valid'; else err 'Apache config invalid'; fi
   fi
 else
   log 'Tes konfigurasi Nginx/Apache dilewati pada non-root (tidak berarti failed).'
@@ -809,7 +1075,7 @@ primary_version() {
   local path=$1 primary=$2 r
   r=$(awk -F '|' -v want="$primary" '$1==want{print $2;exit}' "$path")
   if [[ -z $r ]]; then r=$(awk -F '|' 'NR==1{print $2;exit}' "$path"); fi
-  printf '%s' "${r:-tidak terpasang / tidak ditemukan}"
+  printf '%s' "${r:-N/A}"
 }
 PHP_OLD=$(primary_version "$TMP/php-before" /usr/bin/php)
 PHP_NEW=$(primary_version "$TMP/php-after" /usr/bin/php)
@@ -822,9 +1088,8 @@ RESTART_FAIL=$(grep -c '|FAIL|' "$TMP/restart-results" || true)
 printf 'Hostname          : %s\n' "$(hostname)"
 printf 'Pengguna login    : %s\n' "$ORIGINAL_USER"
 printf 'Pengguna efektif  : %s\n' "$EXEC_USER"
-printf 'Mode / lingkungan : %s / %s\n' "$MODE" "$([[ $CONTAINER == yes ]] && echo container || echo host)"
 printf 'IP lokal          : %s\nIP publik (egress): %s\n' "$LOCAL_IP" "$PUBLIC_IP"
-printf 'CPU               : %s%% (%s), load: %s\n' "$CPU_USED" "$CPU_VIEW" "$LOADAVG"
+printf 'CPU               : %s%% (%s)\n' "$CPU_USED" "$CPU_VIEW"
 printf 'RAM               : %s / %s GiB used | %s GiB available\n' "$(gib "$MEM_USED")" "$(gib "$MEM_TOTAL")" "$(gib "$MEM_AVAIL")"
 printf 'Disk %-12s : %s / %s GiB used | %s GiB free\n' "$DISK_PATH" "$(gib "$DISK_USED")" "$(gib "$DISK_TOTAL")" "$(gib "$DISK_AVAIL")"
 printf 'PHP               : %s -> %s\n' "$PHP_OLD" "$PHP_NEW"
