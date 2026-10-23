@@ -49,70 +49,31 @@ chmod +x ubuntu-maintenance-v03.sh
 
 Sebaiknya **periksa isi file** sebelum menjalankannya sebagai root, misalnya dengan `less ubuntu-maintenance-v03.sh`.
 
-### 2. Audit server (tanpa upgrade)
+### 2. Audit server — satu baris (tanpa upgrade)
 
-Jika skrip sudah diunduh di direktori saat ini:
-
-```bash
-bash ./ubuntu-maintenance-v03.sh --audit
-```
-
-Untuk inventaris proses dan service yang lebih lengkap:
-
-```bash
-sudo bash ./ubuntu-maintenance-v03.sh --audit
-```
-
-**Alternatif satu baris — download lalu langsung audit (bukan upgrade):**
+Unduh skrip dari GitHub lalu jalankan audit dalam **satu perintah**:
 
 ```bash
 curl -fsSLo /tmp/ubuntu-maintenance-v03.sh https://raw.githubusercontent.com/vaisaldarmawan/updatephpandnodejs/main/ubuntu-maintenance-v03.sh && sudo bash /tmp/ubuntu-maintenance-v03.sh --audit
 ```
 
+Perintah ini **hanya melakukan audit**, tidak meng-upgrade paket maupun me-restart service.
+
 > [!CAUTION]
-> URL `main` dapat berubah ketika repository diperbarui. Untuk produksi, **review isi skrip dan pin URL ke full commit SHA** yang telah Anda setujui sebelum menjalankannya sebagai root. Jangan menjalankan skrip jarak jauh dengan pola `curl | sudo bash` tanpa pemeriksaan.
+> URL `main` dapat berubah ketika repository diperbarui. Untuk server produksi, **periksa isi skrip dan gunakan URL dengan full commit SHA** yang sudah Anda setujui sebelum mengeksekusinya sebagai root. Hindari pola `curl | sudo bash` tanpa pemeriksaan.
 
-### 3. Lihat simulasi output
+## Upgrade (opsional)
 
-```bash
-bash ./ubuntu-maintenance-v03.sh --demo
-```
-
-Mode `--demo` menampilkan data **fiktif** dan tidak melakukan maintenance pada server.
-
-### 4. Konfigurasi health check sebelum upgrade
-
-Buat file `/etc/ubuntu-maintenance/healthchecks.tsv` dengan format berikut (**pemisah `|`**, bukan tab):
-
-```text
-# nama|url|expected_http_status
-api|http://127.0.0.1:3000/health|200
-webhook|http://127.0.0.1:3001/health|200
-cms|http://127.0.0.1:8080/health|200
-```
-
-Contoh membuatnya:
+Jika Anda menggunakan unduhan satu baris pada langkah 2, setelah menyiapkan health check aplikasi jalankan:
 
 ```bash
-sudo install -d -m 700 /etc/ubuntu-maintenance
-sudo nano /etc/ubuntu-maintenance/healthchecks.tsv
-sudo chmod 600 /etc/ubuntu-maintenance/healthchecks.tsv
+sudo bash /tmp/ubuntu-maintenance-v03.sh --apply --health-file /etc/ubuntu-maintenance/healthchecks.tsv
 ```
 
-Sesuaikan nama/port/endpoint dengan aplikasi Anda. Jangan memasukkan credential atau token rahasia dalam URL karena konfigurasi atau diagnostik dapat terekspos secara tidak sengaja. Endpoint sebaiknya dapat diakses dari **lingkungan tempat skrip dijalankan**.
-
-> Status PM2 `online` atau systemd `active` hanya menunjukkan proses hidup; status aplikasi **belum terverifikasi sehat** apabila tidak ada health check yang relevan.
-
-### 5. Jalankan upgrade (server Ubuntu, root)
-
-```bash
-sudo bash ./ubuntu-maintenance-v03.sh --apply --health-file /etc/ubuntu-maintenance/healthchecks.tsv
-```
-
-`--apply` memerlukan root dan secara default menolak upgrade bila tidak ada HTTP health check yang valid. Penggunaan `--allow-unverified` tersedia sebagai *override* berisiko; **tidak disarankan untuk produksi**.
+File health check harus sudah tersedia. Format setiap baris: `nama|url|expected_http_status` (contoh: `api|http://127.0.0.1:3000/health|200`). `--apply` membutuhkan hak root dan secara default menolak upgrade tanpa health check yang valid. Opsi `--allow-unverified` dapat melewati pemeriksaan tersebut, tetapi **tidak disarankan di produksi**.
 
 > [!WARNING]
-> **`--apply` menjalankan `apt-get upgrade` untuk paket APT yang memiliki pembaruan, bukan hanya PHP dan Node.js.** Beberapa paket/daemon dapat me-restart service lewat mekanisme paket Ubuntu sebelum tahap restart terarah skrip. Tinjau daftar paket yang akan berubah, backup, dan lakukan rollout bertahap.
+> **`--apply` menjalankan `apt-get upgrade` terhadap semua paket APT yang memiliki pembaruan, bukan hanya PHP dan Node.js.** Pembaruan paket juga bisa me-restart service sebelum tahap restart terarah. Siapkan backup/snapshot dan maintenance window, lalu lakukan rollout bertahap.
 
 ## Opsi CLI
 
