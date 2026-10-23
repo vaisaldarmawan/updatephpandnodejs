@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-SCRIPT_VERSION='0.4.8'
+SCRIPT_VERSION='0.4.9'
 MODE='audit'
 ALLOW_CONTAINER=0
 UPDATE_NVM=0
@@ -47,6 +47,7 @@ NODE_REPO_CREATED_PATHS=()
 NODE_REPO_BACKUP_PATHS=()
 NODE_REPO_BACKUP_FILES=()
 NODE_LTS_APT_ARGS=('nodejs')
+NODE_APT_ALLOWED_REMOVALS=()
 NODE_MAJOR_INSTALLED=0
 START_PHASE_DONE=0
 STOP_PHASE_ENTERED=0
@@ -60,12 +61,12 @@ FORCE_UNMANAGED_COUNT=0
 
 usage() {
 cat <<'HELP'
-Ubuntu Maintenance v0.4.8 — terminal-only (no report upload or saved logs)
+Ubuntu Maintenance v0.4.9 — terminal-only (no report upload or saved logs)
 
-  bash ubuntu-maintenance-v0.4.8.sh --audit             # regular user or root
-  sudo bash ubuntu-maintenance-v0.4.8.sh --audit        # fuller host inventory
-  bash ubuntu-maintenance-v0.4.8.sh --demo              # simulated terminal view
-  sudo bash ubuntu-maintenance-v0.4.8.sh --apply        # stop managed apps, upgrade runtimes, start and verify
+  bash ubuntu-maintenance-v0.4.9.sh --audit             # regular user or root
+  sudo bash ubuntu-maintenance-v0.4.9.sh --audit        # fuller host inventory
+  bash ubuntu-maintenance-v0.4.9.sh --demo              # simulated terminal view
+  sudo bash ubuntu-maintenance-v0.4.9.sh --apply        # stop managed apps, upgrade runtimes, start and verify
 
 Options:
   --audit                 Read-only inventory (default), supports non-root/container
@@ -103,7 +104,7 @@ HELP
 demo() {
 cat <<'DEMO'
 ╔════════════════════════════════════════════════════════════════════╗
-║  UBUNTU MAINTENANCE v0.4.8 • SIMULASI (BUKAN HASIL SERVER ASLI)   ║
+║  UBUNTU MAINTENANCE v0.4.9 • SIMULASI (BUKAN HASIL SERVER ASLI)   ║
 ╚════════════════════════════════════════════════════════════════════╝
 [15:08:21] Mode              : APPLY
 [15:08:21] Hostname          : prod-api-01
@@ -1422,8 +1423,69 @@ prepare_nodesource_lts() {
   log "NodeSource: cabang $old_major.x → $NODE_LTS_MAJOR.x (LTS; upgrade dari --apply)."
 }
 
+# Validate the APT transaction BEFORE modifying installed Node. Ubuntu's
+# individually packaged JS build modules often conflict with the NodeSource
+# nodejs package, which bundles npm. Never permit general package removals.
+node_lts_validate_removals() {
+  local plan=$1 line pkg count=0
+  local blocked=() allowed=()
+  NODE_APT_ALLOWED_REMOVALS=()
+  : > "$TMP/node-planned-removals"
+  if command -v apt-mark >/dev/null 2>&1; then
+    apt-mark showauto > "$TMP/node-auto-packages" 2>/dev/null || : > "$TMP/node-auto-packages"
+  else
+    : > "$TMP/node-auto-packages"
+  fi
+  while IFS= read -r line; do
+    [[ $line == 'Remv '* ]] || continue
+    pkg=${line#Remv }; pkg=${pkg%% *}
+    [[ -n $pkg ]] || continue
+    printf '%s\n' "$pkg" >> "$TMP/node-planned-removals"
+    count=$((count+1))
+    case "$pkg" in
+      npm|nodejs-doc|libnode-dev|node-css-loader)
+        allowed+=("$pkg")
+        ;;
+      node-*)
+        # Auto-installed Ubuntu Node libraries can normally be replaced by
+        # per-project npm dependencies. Do not auto-remove Node-based services,
+        # and do not auto-remove manually installed Node application packages.
+        case "$pkg" in
+          node-red|node-red-*|node-exporter*|node-forever|node-pm2|node-supervisor)
+            blocked+=("$pkg") ;;
+          *)
+            if grep -Fxq -- "$pkg" "$TMP/node-auto-packages"; then
+              allowed+=("$pkg")
+            else
+              blocked+=("$pkg")
+            fi
+            ;;
+        esac
+        ;;
+      *) blocked+=("$pkg") ;;
+    esac
+  done < "$plan"
+  if (( ${#blocked[@]} > 0 )); then
+    local blocked_text
+    blocked_text=$(printf '%s, ' "${blocked[@]}")
+    blocked_text=${blocked_text%, }
+    err "Node LTS: rencana APT ingin menghapus paket yang belum disetujui: $blocked_text. Upgrade Node dibatalkan."
+    log 'Periksa dependensi paket tersebut; tidak akan menjalankan apt dengan --force-yes atau membuangnya diam-diam.'
+    return 1
+  fi
+  if ((count>0)); then
+    NODE_APT_ALLOWED_REMOVALS=("${allowed[@]}")
+    local allowed_text
+    allowed_text=$(printf '%s, ' "${allowed[@]}")
+    allowed_text=${allowed_text%, }
+    warn "Migrasi Node: APT akan melepas ${count} paket modul/tooling Ubuntu: $allowed_text."
+    log 'Catatan: tooling build Ubuntu yang dilepas mungkin perlu dipasang ulang sebagai dependensi proyek via npm.'
+  fi
+  return 0
+}
+
 node_lts_install() {
-  local candidate major rc installed_pkg
+  local candidate major installed_pkg pkg
   candidate=$(awk '$1=="Candidate:" {print $2}' "$TMP/node-apt-policy")
   major=$(printf '%s\n' "${candidate#*:}" | awk -F'.' '$1~/^[0-9]+$/ {print $1}')
   if [[ $major != "$NODE_LTS_MAJOR" ]]; then
@@ -1437,60 +1499,57 @@ node_lts_install() {
   fi
   NODE_LTS_APT_ARGS=('nodejs')
   if (( NODE_NEW_REPO == 1 )); then
-    # NodeSource nodejs bundles npm; Ubuntu's separate npm/docs/devel packages
-    # can collide at dpkg file level even if apt-get -s alone appears fine.
+    # NodeSource bundles npm; Ubuntu's separately packaged npm/docs/headers
+    # must be removed explicitly to avoid dpkg file collisions.
     for pkg in npm nodejs-doc libnode-dev; do
       if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q '^install ok installed$'; then
         NODE_LTS_APT_ARGS+=("${pkg}-")
       fi
     done
   fi
-  if ! env DEBIAN_FRONTEND=noninteractive apt-get -s install "${NODE_LTS_APT_ARGS[@]}" > "$TMP/node-install-plan" 2>&1 || grep -q '^Remv ' "$TMP/node-install-plan"; then
-    # NodeSource bundles npm; Ubuntu may have a separate package named npm.
-    # Explicitly request removal of only this narrow set, and reject anything
-    # else the resolver wants to remove (especially application dependencies).
-    NODE_LTS_APT_ARGS=('nodejs')
-    for pkg in npm nodejs-doc libnode-dev; do
-      if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q '^install ok installed$'; then
-        NODE_LTS_APT_ARGS+=("${pkg}-")
-      fi
-    done
-    if ! env DEBIAN_FRONTEND=noninteractive apt-get -s install "${NODE_LTS_APT_ARGS[@]}" > "$TMP/node-install-plan" 2>&1; then
-      err 'Simulasi instalasi Node 24 LTS gagal. Periksa konflik paket npm/libnode; service akan dihidupkan lagi.'
-      return 1
-    fi
-    if grep '^Remv ' "$TMP/node-install-plan" | awk '$2!="npm" && $2!="nodejs-doc" && $2!="libnode-dev" {bad=1;print} END{exit !bad}' > "$TMP/node-unexpected-removals"; then
-      err "APT ingin menghapus paket di luar npm/nodejs-doc/libnode-dev: $(head -n 1 "$TMP/node-unexpected-removals"). Dibatalkan."
-      return 1
-    fi
-    if (( ${#NODE_LTS_APT_ARGS[@]} > 1 )); then
-      warn 'NodeSource menggantikan paket npm/nodejs-doc/libnode-dev distribusi (sesuai hasil simulasi); npm NodeSource akan diperiksa sesudah upgrade.'
-    fi
+  if ! env DEBIAN_FRONTEND=noninteractive apt-get -s install "${NODE_LTS_APT_ARGS[@]}" > "$TMP/node-install-plan" 2>&1; then
+    err 'Simulasi APT untuk Node 24 gagal. Paket tidak diubah; periksa konflik versi dan dependensi.'
+    return 1
   fi
-  if grep -q '^Remv ' "$TMP/node-install-plan"; then
-    if grep '^Remv ' "$TMP/node-install-plan" | awk '$2!="npm" && $2!="nodejs-doc" && $2!="libnode-dev" {bad=1;print} END{exit !bad}' > "$TMP/node-unexpected-removals"; then
-      err "APT ingin menghapus paket yang tidak disetujui: $(head -n 1 "$TMP/node-unexpected-removals"). Dibatalkan."
-      return 1
-    fi
+  if ! node_lts_validate_removals "$TMP/node-install-plan"; then
+    return 1
   fi
-  # Verify the simulation installs a NodeSource 24.x package, not Ubuntu's 18.x.
-  if ! grep -Eq '^Inst nodejs .*24\.' "$TMP/node-install-plan" && ! grep -Eq '^Inst nodejs .*\(24\.' "$TMP/node-install-plan"; then
+  # Verify the simulated transaction installs Node 24, not just leaves Node 18.
+  if ! grep -Eq '^Inst nodejs .*24\.' "$TMP/node-install-plan" &&
+     ! grep -Eq '^Inst nodejs .*\(24\.' "$TMP/node-install-plan"; then
     err 'Rencana APT tidak menunjukkan pemasangan Node 24.x; upgrade dibatalkan.'
     return 1
   fi
-  # From this point dpkg may change the installed major; never restore the old repo blindly.
+  # dpkg may now change the major. Preserve new repo if installation partially
+  # succeeds; blindly restoring the old repo would make recovery more difficult.
   NODE_MAJOR_INSTALLED=1
   if ! run_quiet 'Node LTS Upgrade' env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none NEEDRESTART_MODE=l apt-get -qq -o DPkg::Lock::Timeout=60 -o Dpkg::Options::=--force-confold -y install "${NODE_LTS_APT_ARGS[@]}"; then
     return 1
   fi
   major=$(/usr/bin/node -p 'process.versions.node.split(".")[0]' 2>/dev/null || true)
   if [[ $major != "$NODE_LTS_MAJOR" ]]; then
-    err "Node.js sesudah instalasi bukan $NODE_LTS_MAJOR.x; periksa paket yang terpasang."
-    NODE_MAJOR_INSTALLED=1  # leave new repository in place if package state is uncertain
+    err "Node.js sesudah instalasi bukan $NODE_LTS_MAJOR.x; periksa status dpkg dan binary."
     return 1
   fi
-  NODE_MAJOR_INSTALLED=1
-  ok "Node.js LTS $NODE_LTS_MAJOR.x terpasang; aplikasi akan divalidasi terpisah."
+  if ! command -v npm >/dev/null 2>&1 || ! npm -v > "$TMP/node-npm-version" 2>&1; then
+    err 'Node LTS terpasang tetapi npm tidak dapat dijalankan. Periksa paket NodeSource sebelum melanjutkan.'
+    return 1
+  fi
+  if [[ -s $TMP/node-planned-removals ]]; then
+    local missing=() removed=()
+    while IFS= read -r pkg; do
+      if ! dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q '^install ok installed$'; then
+        removed+=("$pkg")
+      fi
+    done < "$TMP/node-planned-removals"
+    if (( ${#removed[@]} > 0 )); then
+      local removed_text
+      removed_text=$(printf '%s, ' "${removed[@]}")
+      removed_text=${removed_text%, }
+      warn "Paket distribusi yang benar-benar dilepas: $removed_text."
+    fi
+  fi
+  ok "Node.js LTS $NODE_LTS_MAJOR.x dan npm $(cat "$TMP/node-npm-version") terpasang; aplikasi akan divalidasi terpisah."
 }
 
 if [[ $MODE == apply ]]; then
