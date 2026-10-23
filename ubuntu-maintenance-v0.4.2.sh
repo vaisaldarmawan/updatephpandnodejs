@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-SCRIPT_VERSION='0.4.0'
+SCRIPT_VERSION='0.4.2'
 MODE='audit'
 ALLOW_CONTAINER=0
 UPDATE_NVM=0
@@ -35,27 +35,32 @@ NODE_LTS_MAJOR=24
 PHP_STABLE_SERIES='8.5'
 PHP_MIGRATED=0
 NODE_LTS_SKIPPED=0
+UNMANAGED_NODE_UPGRADE=0
+UNMANAGED_NODE_POST=0
+RUNTIME_TARGET_FAILED=0
 NODE_SOURCE_FILE=''
 NODE_SOURCE_BACKUP=''
 NODE_SOURCE_SWITCHED=0
 NODE_MAJOR_INSTALLED=0
+START_PHASE_DONE=0
+STOP_PHASE_ENTERED=0
 
 usage() {
 cat <<'HELP'
-Ubuntu Maintenance v0.4.0 — terminal-only (no report upload or saved logs)
+Ubuntu Maintenance v0.4.2 — terminal-only (no report upload or saved logs)
 
-  bash ubuntu-maintenance-v03.sh --audit             # regular user or root
-  sudo bash ubuntu-maintenance-v03.sh --audit        # fuller host inventory
-  bash ubuntu-maintenance-v03.sh --demo              # simulated terminal view
-  sudo bash ubuntu-maintenance-v03.sh --apply        # update + stable runtime migration where safe
+  bash ubuntu-maintenance-v0.4.2.sh --audit             # regular user or root
+  sudo bash ubuntu-maintenance-v0.4.2.sh --audit        # fuller host inventory
+  bash ubuntu-maintenance-v0.4.2.sh --demo              # simulated terminal view
+  sudo bash ubuntu-maintenance-v0.4.2.sh --apply        # stop managed apps, upgrade runtimes, start and verify
 
 Options:
   --audit                 Read-only inventory (default), supports non-root/container
-  --apply                 APT upgrade + auto stable PHP/Node where safe (Ubuntu, root)
+  --apply                 Stop managed PHP/Node apps, upgrade runtimes, start apps, verify
   --allow-container-apply Explicitly permit APT inside container (no auto restarts)
   --update-nvm            Update NVM default within its existing major (optional)
-  --node-lts              Require an eligible NodeSource path to Node 24 LTS (strict mode)
-  --no-restart            Do not automatically restart active PHP-FPM/PM2 and affected services
+  --node-lts              Require a recognized NodeSource path to Node 24 LTS (strict mode)
+  --no-restart            Do not stop/start managed apps (not recommended for major upgrades)
   --no-public-ip          Never contact an external IP lookup endpoint
   --disk-path PATH        Filesystem to report (default /)
   --demo                  Simulated, fictional output; no system operations
@@ -64,9 +69,9 @@ Options:
 Important:
 * APT updates installed Ubuntu-managed PHP/Node packages, NOT NVM/asdf/fnm,
   Docker images, or binaries installed manually. PHP 8.5 requires an existing compatible APT repository; the script never silently adds a PPA.
-* Node 24 LTS migration is automatic only for managed NodeSource installs without unmanaged Node processes.
-* PHP 8.5 CLI migration runs only for CLI-only installs with matching modules; existing PHP-FPM virtual hosts are never automatically rewired.
-* Apply needs no configuration file; post-upgrade verification checks process/systemd/PM2 status, not HTTP functionality.
+* Managed PHP/Node systemd services and online PM2 apps are stopped before changing packages and started afterward, including recovery attempts on failure. An unsupervised process cannot be safely restarted automatically and remains running; restart it manually.
+* PHP 8.5 CLI migration runs only for CLI-only installs with matching modules; existing PHP-FPM virtual hosts are never automatically rewired. Latest PHP major may remain pending on FPM-backed sites.
+* Apply needs no configuration file; post-upgrade verification checks process/systemd/PM2 status, not HTTP functionality. During the stop→start window, monitored applications may be unavailable.
 * No automatic reboot, rollback, or container orchestration actions.
 * apt-get itself can restart services before our controlled restart phase.
 * Only terminal text is output; an internal temporary directory is removed on exit.
@@ -76,7 +81,7 @@ HELP
 demo() {
 cat <<'DEMO'
 ╔════════════════════════════════════════════════════════════════════╗
-║  UBUNTU MAINTENANCE v0.4.0 • SIMULASI (BUKAN HASIL SERVER ASLI)   ║
+║  UBUNTU MAINTENANCE v0.4.2 • SIMULASI (BUKAN HASIL SERVER ASLI)   ║
 ╚════════════════════════════════════════════════════════════════════╝
 [15:08:21] Mode              : APPLY
 [15:08:21] Hostname          : prod-api-01
@@ -91,33 +96,38 @@ cat <<'DEMO'
 [15:08:21] Disk /            : 42.00 GiB terpakai / 100.00 GiB total (58.00 GiB free)
 
 ──── [01] RUNTIME AWAL ────
-[15:08:22] ✓ PHP   /usr/bin/php     : 8.3.34
+[15:08:22] ✓ PHP   /usr/bin/php     : 8.5.12
 [15:08:22] ✓ Node  /usr/bin/node    : v22.23.2
-[15:08:22] ✓ NVM ditemukan (deploy): runtime dikelola terpisah
+[15:08:22] NVM: tidak ditemukan
 
 ──── [02] APLIKASI / BASELINE ────
 [15:08:23] ✓ systemd  api.service        active    /usr/bin/node
 [15:08:23] ✓ pm2      webhook (deploy)   online    PID 8812
-[15:08:23] ✓ php-fpm  php8.3-fpm.service active
+[15:08:23] ✓ php-fpm  php8.5-fpm.service active
 [15:08:23] ✓ baseline api.service aktif dan webhook PM2 online
 
-──── [03] PEMBARUAN PAKET ────
-[15:08:25] Apt Update   [done]
-[15:08:36] Apt Upgrade  [done]
-[15:08:44] PHP 8.5 CLI       [done]
-[15:08:50] Node 24 LTS       [done]
+──── [03] STOP SERVICE (YANG SEBELUMNYA AKTIF) ────
+[15:08:24] Stop php8.5-fpm.service   [done]
+[15:08:25] Stop api.service          [done]
+[15:08:26] Stop PM2 deploy/webhook   [done]
 
-──── [04] RESTART TERARAH ────
-[15:08:58] ✓ php8.3-fpm.service : restart berhasil; active
-[15:09:01] ✓ api.service        : restart berhasil; active
-[15:09:04] ✓ pm2 deploy/webhook : reload berhasil; online
-[15:09:05] ✓ Verifikasi proses : systemd active; PM2 online
+──── [04] UPGRADE RUNTIME & PAKET ────
+[15:08:30] Apt Update               [done]
+[15:08:38] Node 24 LTS Upgrade      [done]
+[15:08:53] Apt Upgrade              [done]
+[15:08:59] PHP Stable Check         [done]
+
+──── [05] START SERVICE & VERIFIKASI ────
+[15:09:03] Start php8.5-fpm.service  [done]
+[15:09:05] Start api.service         [done]
+[15:09:08] Start PM2 deploy/webhook  [done]
+[15:09:10] Verifikasi proses        [done]
 
 ╔═══════════════════ RINGKASAN ═════════════════════════════════════╗
   Login / eksekusi   : deploy / root
   IP lokal / publik  : 192.168.10.20 / 203.0.113.20
-  PHP               : 8.3.34 -> 8.3.36
-  Node.js (APT)     : v22.23.2 -> v22.23.4
+  PHP               : 8.5.12 -> 8.5.12
+  Node.js (APT)     : v20.20.2 -> v24.22.1
   CPU / RAM / Disk  : 12.8% | 3.20 / 8.00 GiB | 58.00 / 100.00 GiB free
   Node apps         : api.service [active], webhook [online]
   Status aplikasi   : 2 aktif / 0 gagal (level proses)
@@ -169,6 +179,10 @@ section() { STEP=$((STEP+1)); printf '\n%s──── [%02d] %s ────%s\
 cleanup() {
   local rc=$?
   trap - EXIT
+  if (( STOP_PHASE_ENTERED == 1 && START_PHASE_DONE == 0 )) && declare -F bring_back_managed >/dev/null 2>&1; then
+    printf '\n[RECOVERY] Upaya menghidupkan kembali service/aplikasi yang dihentikan...\n' >&2
+    bring_back_managed || true
+  fi
   if (( NODE_SOURCE_SWITCHED == 1 && NODE_MAJOR_INSTALLED == 0 )) && [[ -n $NODE_SOURCE_FILE && -f $NODE_SOURCE_BACKUP ]]; then
     cp -p -- "$NODE_SOURCE_BACKUP" "$NODE_SOURCE_FILE" || printf 'WARNING: failed restoring NodeSource repository %s\n' "$NODE_SOURCE_FILE" >&2
   fi
@@ -550,7 +564,132 @@ section 'BASELINE SERVICE / PROSES'
 log 'Baseline dicatat otomatis dari systemd, PM2, dan proses Node.js.'
 log 'Tidak perlu konfigurasi tambahan. Status proses saja tidak menjamin fungsi API/DB/queue.'
 
-# Deliberate NodeSource migration, never triggered by plain --apply.
+restart_record() { printf '%s|%s|%s\n' "$1" "$2" "$3" >> "$TMP/restart-results"; }
+
+# Snapshot-driven lifecycle. Never stop bare process/screen/tmux workloads:
+# their startup commands and environment cannot be faithfully reconstructed.
+: > "$TMP/stopped-services"
+: > "$TMP/stopped-pm2"
+: > "$TMP/stop-plan-services"
+: > "$TMP/stop-plan-pm2"
+
+pm2_run_as() {
+  local user=$1 home=$2 bin=$3; shift 3
+  timeout 60 runuser -u "$user" -- env HOME="$home" PM2_HOME="$home/.pm2" PATH="$(dirname "$bin"):$PATH" "$bin" "$@"
+}
+
+managed_stop_plan() {
+  local mgr user name status pid exe pmuser pmname pmstatus pmpid id bin home unit
+  : > "$TMP/stop-plan-services"
+  : > "$TMP/stop-plan-pm2"
+  while IFS='|' read -r unit status; do
+    [[ $status == active ]] || continue
+    if [[ $unit =~ ^php[0-9.]+-fpm\.service$ ]]; then
+      printf '%s\n' "$unit" >> "$TMP/stop-plan-services"
+    elif [[ $unit == apache2.service ]] && grep -q '^libapache2-mod-php' "$TMP/packages-before" 2>/dev/null; then
+      printf '%s\n' "$unit" >> "$TMP/stop-plan-services"
+    fi
+  done < "$TMP/services-before"
+  while IFS='|' read -r mgr user name status pid exe; do
+    [[ $mgr == systemd && $status == active && $name == *.service ]] || continue
+    case "$name" in
+      pm2-*.service|user@*.service|systemd-*.service) continue ;;
+    esac
+    [[ $name =~ ^[A-Za-z0-9_.@-]+\.service$ ]] || continue
+    # If the PID belongs to a PM2-managed app, control it via PM2 instead.
+    if awk -F '|' -v p="$pid" '$4==p {f=1} END{exit !f}' "$TMP/pm2-before"; then continue; fi
+    printf '%s\n' "$name" >> "$TMP/stop-plan-services"
+  done < "$TMP/node-apps-before"
+  # Include PHP workers even when systemd unit names do not start with php.
+  local php_pid php_comm
+  while IFS=' ' read -r php_pid php_comm; do
+    [[ $php_pid =~ ^[0-9]+$ && $php_comm =~ ^php([0-9.]+)?$ ]] || continue
+    unit=$(service_for_pid "$php_pid")
+    [[ $unit == *.service && $unit != user@*.service && $unit != pm2-*.service ]] || continue
+    status=$(systemctl is-active "$unit" 2>/dev/null || true)
+    [[ $status == active ]] && printf '%s\n' "$unit" >> "$TMP/stop-plan-services"
+  done < <(ps -eo pid=,comm= -ww 2>/dev/null || true)
+  sort -u "$TMP/stop-plan-services" -o "$TMP/stop-plan-services"
+
+  while IFS='|' read -r pmuser pmname pmstatus pmpid id bin; do
+    [[ $pmstatus == online && $id =~ ^[0-9]+$ ]] || continue
+    home=$(getent passwd "$pmuser" 2>/dev/null | cut -d: -f6)
+    if [[ -z $home || ! -x $bin ]]; then
+      err "PM2 $pmuser/$pmname aktif namun CLI/home tidak dapat diverifikasi; stop otomatis dibatalkan."
+      return 1
+    fi
+    printf '%s|%s|%s|%s|%s\n' "$pmuser" "$pmname" "$id" "$bin" "$home" >> "$TMP/stop-plan-pm2"
+  done < "$TMP/pm2-before"
+  return 0
+}
+
+stop_managed() {
+  local unit user name id bin home
+  (( RESTART == 1 )) && [[ $CONTAINER == no ]] || return 0
+  section 'STOP SERVICE PHP/NODE SEBELUM UPGRADE'
+  if ! managed_stop_plan; then return 1; fi
+  STOP_PHASE_ENTERED=1
+  while IFS= read -r unit; do
+    [[ -n $unit ]] || continue
+    printf '%s\n' "$unit" >> "$TMP/stopped-services"
+    if run_quiet "Stop $unit" systemctl stop "$unit"; then
+      :
+    else
+      err "Gagal menghentikan $unit; akan dicoba hidupkan kembali sebelum keluar."
+      return 1
+    fi
+  done < "$TMP/stop-plan-services"
+  while IFS='|' read -r user name id bin home; do
+    [[ -n $user ]] || continue
+    printf '%s|%s|%s|%s|%s\n' "$user" "$name" "$id" "$bin" "$home" >> "$TMP/stopped-pm2"
+    if run_quiet "Stop PM2 $user/$name" pm2_run_as "$user" "$home" "$bin" stop "$id"; then
+      :
+    else
+      err "Gagal menghentikan PM2 $user/$name; akan dicoba hidupkan kembali."
+      return 1
+    fi
+  done < "$TMP/stop-plan-pm2"
+  if [[ ! -s $TMP/stopped-services && ! -s $TMP/stopped-pm2 ]]; then
+    log 'Tidak ada PHP/Node service terkelola yang perlu dihentikan.'
+  fi
+  # Unsupervised runtime processes cannot be restarted reliably.
+  while IFS='|' read -r mgr user name status pid exe; do
+    [[ $mgr == process ]] || continue
+    if awk -F '|' -v p="$pid" '$4==p {f=1} END{exit !f}' "$TMP/pm2-before"; then continue; fi
+    warn "Proses mandiri $user/$name (PID $pid) tidak dihentikan: perintah untuk menyalakannya kembali tidak diketahui."
+  done < "$TMP/node-apps-before"
+  return 0
+}
+
+bring_back_managed() {
+  local unit user name id bin home failure=0
+  # This function is also invoked by EXIT recovery. Do not defer starts on APT errors.
+  while IFS= read -r unit; do
+    [[ -n $unit ]] || continue
+    if run_quiet "Start $unit" systemctl start "$unit" && systemctl is-active --quiet "$unit"; then
+      restart_record "$unit" OK active
+    else
+      err "$unit tidak aktif setelah start."
+      restart_record "$unit" FAIL start
+      failure=1
+    fi
+  done < "$TMP/stopped-services"
+  while IFS='|' read -r user name id bin home; do
+    [[ -n $user ]] || continue
+    if run_quiet "Start PM2 $user/$name" pm2_run_as "$user" "$home" "$bin" start "$id"; then
+      restart_record "pm2:$user/$name" OK started
+    else
+      err "PM2 $user/$name gagal start."
+      restart_record "pm2:$user/$name" FAIL start
+      failure=1
+    fi
+  done < "$TMP/stopped-pm2"
+  START_PHASE_DONE=1
+  if ((failure)); then RESTART_FAILED=1; return 1; fi
+  return 0
+}
+
+# NodeSource major migration is part of --apply when its repository is recognized.
 # Only modify the single recognized NodeSource APT source (its signing key stays unchanged).
 prepare_nodesource_lts() {
   local candidate file source_count=0 mgr user name status pid exe old_major new_content
@@ -568,13 +707,16 @@ prepare_nodesource_lts() {
     log "Node.js sudah di cabang LTS $NODE_LTS_MAJOR.x. Upgrade patch tetap melalui APT."
     return 0
   fi
-  # Never interrupt bare processes with unknown restart mechanisms.
+  # Do not stop a bare process; upgrading an installed binary does not replace
+  # the interpreter of an already running application. Surface that fact later.
   while IFS='|' read -r mgr user name status pid exe; do
     [[ $mgr == process && $exe == /usr/bin/node* ]] || continue
     if [[ -s $TMP/pm2-before ]] && awk -F '|' -v p="$pid" '$4==p {f=1} END{exit !f}' "$TMP/pm2-before"; then continue; fi
-    err "Node LTS ditolak: $user/$name (PID $pid) belum punya pengelola restart teridentifikasi. Migrasi manual diperlukan."
-    return 1
+    UNMANAGED_NODE_UPGRADE=1
   done < "$TMP/node-apps-before"
+  if (( UNMANAGED_NODE_UPGRADE )); then
+    warn 'Ada proses Node tanpa supervisor: runtime paket tetap akan di-upgrade, tetapi aplikasi tersebut perlu restart manual.'
+  fi
   for file in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
     [[ -f $file ]] || continue
     if grep -Eq 'deb\.nodesource\.com/node_[0-9]+\.x' "$file"; then
@@ -596,7 +738,7 @@ prepare_nodesource_lts() {
   fi
   cat "$TMP/nodesource.updated" > "$NODE_SOURCE_FILE"
   NODE_SOURCE_SWITCHED=1
-  log "NodeSource: cabang $old_major.x → $NODE_LTS_MAJOR.x (LTS; migrasi mayor eksplisit)."
+  log "NodeSource: cabang $old_major.x → $NODE_LTS_MAJOR.x (LTS; upgrade dari --apply)."
 }
 
 node_lts_install() {
@@ -627,7 +769,7 @@ node_lts_install() {
     return 1
   fi
   NODE_MAJOR_INSTALLED=1
-  ok "Node.js LTS $NODE_LTS_MAJOR.x terpasang."
+  ok "Node.js LTS $NODE_LTS_MAJOR.x terpasang; aplikasi akan divalidasi terpisah."
 }
 
 if [[ $MODE == apply ]]; then
@@ -637,9 +779,15 @@ if [[ $MODE == apply ]]; then
   elif command -v fuser >/dev/null 2>&1 && fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then
     err 'APT/dpkg lock sedang digunakan. Upgrade dibatalkan.'; APPLY_ABORTED=1
   fi
+  if ((APPLY_ABORTED==0)) && [[ $CONTAINER == no && $RESTART -eq 1 ]]; then
+    if [[ -r /var/lib/dpkg/status ]]; then
+      dpkg-query -W -f='${binary:Package}\t${Version}\n' > "$TMP/packages-before" 2>/dev/null || true
+    fi
+    if ! stop_managed; then APPLY_ABORTED=1; fi
+  fi
   if ((APPLY_ABORTED==0)); then
-    # Default --apply attempts the latest production LTS only for existing
-    # NodeSource-managed installations with a clearly restartable workload.
+    # Default --apply upgrades NodeSource-managed Node to production LTS.
+    # Unmanaged applications are not terminated and remain pending restart.
     if ((NODE_LTS==0 && AUTO_LTS==1)) && [[ -x /usr/bin/node ]] &&
        dpkg-query -W -f='${Status}' nodejs 2>/dev/null | grep -q '^install ok installed$'; then
       if [[ -n $(grep -El 'deb\.nodesource\.com/node_[0-9]+\.x' /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true) ]]; then
@@ -652,18 +800,8 @@ if [[ $MODE == apply ]]; then
         fi
       fi
     fi
-    if ((NODE_LTS==1)); then
-      # A bare Node process may run under screen/nohup and cannot be restarted
-      # reliably. Keep same-major APT maintenance available in that situation.
-      unmanaged=0
-      while IFS='|' read -r mgr u app state pid exe; do
-        [[ $mgr == process && $exe == /usr/bin/node* ]] || continue
-        if [[ -s $TMP/pm2-before ]] && awk -F '|' -v p="$pid" '$4==p{found=1} END{exit !found}' "$TMP/pm2-before"; then continue; fi
-        unmanaged=1
-        warn "Node LTS: $u/$app (PID $pid) tidak dikelola supervisor yang dapat direstart; migrasi major dilewati."
-      done < "$TMP/node-apps-before"
-      if ((unmanaged==1 && AUTO_LTS==1)); then NODE_LTS=0; NODE_LTS_SKIPPED=1; fi
-    fi
+    # An unsupervised Node process is not reason to skip installing the requested
+    # LTS runtime. It is, however, a reason NOT to claim the application migrated.
     if ((NODE_LTS==1)); then
       if ! prepare_nodesource_lts; then
         if ((AUTO_LTS==1)); then
@@ -714,7 +852,7 @@ if [[ $MODE == apply ]]; then
       log "Node APT: $installed -> $candidate (major $installed_major -> $candidate_major)"
       if [[ $installed_major != "$candidate_major" ]]; then
         if ((NODE_LTS == 1)) && [[ $candidate_major == "$NODE_LTS_MAJOR" ]]; then
-          log "Node LTS: major $installed_major.x → $candidate_major.x diizinkan oleh --node-lts."
+          log "Node LTS: major $installed_major.x → $candidate_major.x diizinkan oleh kebijakan --apply."
         else
           err "Node APT kandidat major berbeda ($installed -> $candidate). Upgrade dibatalkan; review repo dahulu."
           return 1
@@ -900,73 +1038,35 @@ if [[ $MODE == apply && $APT_RAN -eq 1 && $UPDATE_NVM -eq 1 ]]; then
   fi
 fi
 
-restart_record() { printf '%s|%s|%s\n' "$1" "$2" "$3" >> "$TMP/restart-results"; }
-if [[ $MODE == apply && $APT_RAN -eq 1 && $RESTART -eq 1 && $CONTAINER == no ]]; then
-  section 'RESTART SERVICE YANG TERDAMPAK'
-  : > "$TMP/restart-candidates"
-  if [[ -s $TMP/php-before ]] || grep -Eq '^php[0-9.]+-fpm\.service\|active$' "$TMP/services-before"; then
-    awk -F '|' '$1 ~ /^php[0-9.]+-fpm\.service$/ {print $1}' "$TMP/services-before" >> "$TMP/restart-candidates"
-    if grep -q '^libapache2-mod-php' "$TMP/packages-changed"; then
-      printf 'apache2.service\n' >> "$TMP/restart-candidates"
+if [[ $MODE == apply ]]; then
+  section 'START SERVICE PHP/NODE SETELAH UPGRADE'
+  if (( STOP_PHASE_ENTERED == 1 )); then
+    if ! bring_back_managed; then
+      err 'Sebagian service gagal dihidupkan; periksa status secara manual.'
     fi
-    # PHP CLI workers (artisan queue, cron-managed daemons) with a systemd unit.
-    while IFS=' ' read -r pid user comm; do
-      [[ $pid =~ ^[0-9]+$ && $comm =~ ^php([0-9.]+)?$ ]] || continue
-      unit=$(service_for_pid "$pid")
-      [[ $unit == *.service ]] && printf '%s\n' "$unit" >> "$TMP/restart-candidates"
-    done < <(ps -eo pid=,user=,comm= -ww 2>/dev/null || true)
+  elif (( RESTART==0 )); then
+    warn 'Stop/start otomatis tidak dijalankan (--no-restart).'
+  elif [[ $CONTAINER == yes ]]; then
+    warn 'Container: stop/start service harus melalui orchestrator/redeploy image.'
+  else
+    log 'Tidak ada service yang dihentikan (maintenance dibatalkan sebelum tahap stop).'
   fi
-  if ((WEB_CHANGED)); then
-    awk -F '|' '$1=="nginx.service" || $1=="apache2.service" {print $1}' "$TMP/services-before" >> "$TMP/restart-candidates"
+  # Reload web server only if its own packages changed; PHP-FPM starts through snapshot.
+  if (( WEB_CHANGED == 1 && APT_RAN == 1 && RESTART == 1 )) && [[ $CONTAINER == no ]]; then
+    while IFS='|' read -r unit status; do
+      [[ $status == active ]] || continue
+      case "$unit" in
+        nginx.service)
+          if ! nginx -t >"$TMP/nginx-config.log" 2>&1 || ! run_quiet 'Reload nginx' systemctl reload nginx.service; then
+            err 'Reload nginx gagal.'; RESTART_FAILED=1
+          fi ;;
+        apache2.service)
+          if ! apache2ctl configtest >"$TMP/apache-config.log" 2>&1 || ! run_quiet 'Reload Apache' systemctl reload apache2.service; then
+            err 'Reload Apache gagal.'; RESTART_FAILED=1
+          fi ;;
+      esac
+    done < "$TMP/services-before"
   fi
-  if ((NODE_CHANGED)); then
-    while IFS='|' read -r manager user name status pid exe; do
-      [[ $manager == systemd && $exe == /usr/bin/node* ]] && printf '%s\n' "$name" >> "$TMP/restart-candidates"
-    done < "$TMP/node-apps-before"
-  fi
-  awk 'NF && !seen[$0]++ {print}' "$TMP/restart-candidates" > "$TMP/restart-candidates-unique"
-  # PHP workers first, then custom Node services, then web frontends.
-  awk '{p=2;if($0 ~ /^php[0-9.]+-fpm\.service$/)p=0;else if($0 !~ /^(nginx|apache2)\.service$/)p=1;print p"|"$0}' "$TMP/restart-candidates-unique" | sort -t '|' -k1,1n | cut -d '|' -f2- > "$TMP/restart-candidates"
-  while IFS= read -r unit; do
-    [[ $unit =~ ^[A-Za-z0-9_.@-]+\.service$ ]] || continue
-    status_before=$(awk -F '|' -v u="$unit" '$1==u{print $2;exit}' "$TMP/services-before")
-    [[ $status_before == active ]] || { warn "$unit: skip (sebelum upgrade bukan active)"; restart_record "$unit" SKIP 'not previously active'; continue; }
-    if [[ $unit == nginx.service ]] && command -v nginx >/dev/null 2>&1 && ! nginx -t >"$TMP/nginx-config.log" 2>&1; then err "nginx -t gagal; skip restart $unit"; restart_record "$unit" FAIL config; RESTART_FAILED=1; break; fi
-    if [[ $unit == apache2.service ]] && command -v apache2ctl >/dev/null 2>&1 && ! apache2ctl configtest >"$TMP/apache-config.log" 2>&1; then err "apache configtest gagal; skip restart $unit"; restart_record "$unit" FAIL config; RESTART_FAILED=1; break; fi
-    if run_quiet "Restart $unit" systemctl try-restart "$unit" && systemctl is-active --quiet "$unit"; then
-      ok "$unit: active setelah restart"; restart_record "$unit" OK active
-    else err "$unit: restart gagal"; restart_record "$unit" FAIL restart; RESTART_FAILED=1; break; fi
-  done < "$TMP/restart-candidates"
-
-  # Reload previously online PM2 apps after maintenance; retain user identity.
-  # Never reload all apps, and don't wake stopped apps.
-  if ((RESTART_FAILED==0)) && [[ -s $TMP/pm2-before ]]; then
-    while IFS='|' read -r user name status pid id bin; do
-      [[ $status == online && $pid =~ ^[0-9]+$ && $id =~ ^[0-9]+$ ]] || continue
-      exe=$(node_exe "$pid")
-      [[ -n $exe ]] || { warn "PM2 $user/$name: path Node tidak ditemukan; restart dilewati"; continue; }
-      home=$(getent passwd "$user" | cut -d: -f6)
-      [[ -n $home && -x $bin ]] || continue
-      if run_quiet "PM2 Reload $user/$name" timeout 60 runuser -u "$user" -- env HOME="$home" PM2_HOME="$home/.pm2" PATH="$(dirname "$bin"):$PATH" "$bin" reload "$id"; then
-        ok "PM2 $user/$name: reload selesai"; restart_record "pm2:$user/$name" OK online
-      else err "PM2 $user/$name: gagal"; restart_record "pm2:$user/$name" FAIL reload; RESTART_FAILED=1; break; fi
-    done < "$TMP/pm2-before"
-  fi
-  # A bare Node process cannot be safely restarted without knowing its supervisor.
-  # Make this visible; a binary can be updated while the existing process stays old.
-  if ((NODE_CHANGED)); then
-    while IFS='|' read -r manager user name status pid exe; do
-      [[ $manager == process && $exe == /usr/bin/node* ]] || continue
-      if [[ -s $TMP/pm2-before ]] && awk -F '|' -v p="$pid" '$4==p {f=1} END {exit !f}' "$TMP/pm2-before"; then continue; fi
-      warn "Node process $user/$name (PID $pid) tidak memiliki supervisor teridentifikasi; restart manual diperlukan agar memakai Node baru."
-    done < "$TMP/node-apps-before"
-  fi
-  [[ -s $TMP/restart-results ]] || log 'Tidak ada restart yang diperlukan / terverifikasi aman.'
-elif [[ $MODE == apply ]]; then
-  section 'RESTART SERVICE'
-  if ((RESTART==0)); then warn 'Restart dimatikan (--no-restart); aplikasi dapat memakai runtime lama'
-  elif [[ $CONTAINER == yes ]]; then warn 'Container: restart otomatis dimatikan; rebuild/redeploy image untuk produksi'
-  elif ((APT_RAN==0)); then warn 'APT tidak selesai; restart otomatis dilewati'; fi
 fi
 
 section 'VERIFIKASI VERSI DAN APLIKASI TERBARU'
@@ -1061,8 +1161,22 @@ while IFS='|' read -r manager user name before pid exe; do
   # Exclude PM2-managed PIDs, which are checked above.
   if [[ -s $TMP/pm2-before ]] && awk -F '|' -v p="$pid" '$4==p {found=1} END {exit !found}' "$TMP/pm2-before"; then continue; fi
   if awk -F '|' -v u="$user" -v n="$name" '$1=="process" && $2==u && $3==n {found=1} END {exit !found}' "$TMP/node-apps-after"; then
-    ok "Node process $user/$name: proses masih terdeteksi"
-    APP_OK=$((APP_OK+1))
+    if ((NODE_CHANGED)) && [[ $exe == /usr/bin/node* ]]; then
+      # Check matching active PID and executable to avoid claiming the old
+      # running process has switched interpreter after /usr/bin/node is replaced.
+      matching_pid=$(awk -F '|' -v u="$user" -v n="$name" '$1=="process" && $2==u && $3==n {print $5;exit}' "$TMP/node-apps-after")
+      if [[ $matching_pid == "$pid" || $(readlink "/proc/$matching_pid/exe" 2>/dev/null || true) == *' (deleted)' ]]; then
+        warn "Node process $user/$name PID=$pid masih memakai runtime lama; restart manual diperlukan."
+        UNMANAGED_NODE_POST=$((UNMANAGED_NODE_POST+1))
+        APP_UNVERIFIED=$((APP_UNVERIFIED+1))
+      else
+        ok "Node process $user/$name: proses berubah (status proses saja)"
+        APP_OK=$((APP_OK+1))
+      fi
+    else
+      ok "Node process $user/$name: proses masih terdeteksi"
+      APP_OK=$((APP_OK+1))
+    fi
   else
     err "Node process $user/$name: proses tidak ditemukan lagi"
     APP_FAIL=$((APP_FAIL+1))
@@ -1079,9 +1193,22 @@ primary_version() {
 }
 PHP_OLD=$(primary_version "$TMP/php-before" /usr/bin/php)
 PHP_NEW=$(primary_version "$TMP/php-after" /usr/bin/php)
+if [[ $MODE == apply && $PHP_OLD != N/A && $CONTAINER == no ]]; then
+  if [[ $PHP_NEW != "${PHP_STABLE_SERIES}."* ]]; then
+    warn "PHP terpasang tetapi belum mencapai target ${PHP_STABLE_SERIES}.x ($PHP_OLD -> $PHP_NEW). Periksa repository/ekstensi/FPM."
+    RUNTIME_TARGET_FAILED=1
+  fi
+fi
 CURRENT_NODE_PATH=$(command -v node 2>/dev/null || echo /usr/bin/node)
 NODE_OLD=$(primary_version "$TMP/node-before" "$CURRENT_NODE_PATH")
 NODE_NEW=$(primary_version "$TMP/node-after" "$CURRENT_NODE_PATH")
+if [[ $MODE == apply && -x /usr/bin/node && $CONTAINER == no && $NODE_NEW =~ ^v[0-9]+ ]]; then
+  installed_major=${NODE_NEW#v}; installed_major=${installed_major%%.*}
+  if (( installed_major < NODE_LTS_MAJOR )); then
+    warn "Node.js belum mencapai target LTS ${NODE_LTS_MAJOR}.x: ${NODE_OLD} -> ${NODE_NEW}. Periksa sumber instalasi dan repository."
+    RUNTIME_TARGET_FAILED=1
+  fi
+fi
 NODE_APPS_COUNT=0
 RESTART_OK=$(grep -c '|OK|' "$TMP/restart-results" || true)
 RESTART_FAIL=$(grep -c '|FAIL|' "$TMP/restart-results" || true)
@@ -1094,6 +1221,7 @@ printf 'RAM               : %s / %s GiB used | %s GiB available\n' "$(gib "$MEM_
 printf 'Disk %-12s : %s / %s GiB used | %s GiB free\n' "$DISK_PATH" "$(gib "$DISK_USED")" "$(gib "$DISK_TOTAL")" "$(gib "$DISK_AVAIL")"
 printf 'PHP               : %s -> %s\n' "$PHP_OLD" "$PHP_NEW"
 printf 'Node.js (%s): %s -> %s\n' "$CURRENT_NODE_PATH" "$NODE_OLD" "$NODE_NEW"
+if ((UNMANAGED_NODE_POST>0)); then printf 'Node apps pending  : %s perlu restart manual (runtime lama masih berjalan)\n' "$UNMANAGED_NODE_POST"; fi
 if [[ -s $TMP/nvm-after ]]; then printf 'NVM installations : %s detected (not necessarily active)\n' "$(wc -l < "$TMP/nvm-after")"; fi
 log 'Aplikasi Node.js (PM2 / systemd / proses):'
 if [[ -s $TMP/pm2-after ]]; then
@@ -1115,7 +1243,7 @@ printf 'Node app terdeteksi: %s (best-effort, bukan inventaris lengkap)\n' "$NOD
 printf 'Status aplikasi    : %s aktif / %s gagal / %s unverified (proses saja)\n' "$APP_OK" "$APP_FAIL" "$APP_UNVERIFIED"
 printf 'Restart terkait   : %s OK / %s FAIL\n' "$RESTART_OK" "$RESTART_FAIL"
 if [[ -f /run/reboot-required ]]; then warn 'Server memerlukan reboot (tidak dilakukan otomatis)'; fi
-if ((ERRORS>0 || APPLY_ABORTED==1)); then RESULT='FAIL'
+if ((ERRORS>0 || APPLY_ABORTED==1 || RUNTIME_TARGET_FAILED==1)); then RESULT='FAIL'
 elif ((WARN>0 || APP_UNVERIFIED>0)); then RESULT='REVIEW'
 else RESULT='PASS'; fi
 printf 'PERINGATAN        : %s | ERROR: %s\n' "$WARN" "$ERRORS"
