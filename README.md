@@ -1,39 +1,48 @@
 # Ubuntu PHP & Node.js Maintenance
 
-Audit dan upgrade PHP/Node.js yang sudah terpasang, kontrol service, dan verifikasi port/URL web dari terminal. **Versi v0.4.8.** Tidak membutuhkan `healthchecks.tsv` maupun collector laporan.
+Bash script untuk audit server Ubuntu, upgrade PHP/Node.js yang sudah terpasang, stop/start service, dan pengecekan URL/port. **Versi 0.4.9**. Output di terminal, tanpa upload laporan atau `healthchecks.tsv`.
 
 ## 1. Download
 
 ```bash
-curl -fL --retry 3 -o ubuntu-maintenance-v0.4.8.sh https://raw.githubusercontent.com/vaisaldarmawan/updatephpandnodejs/main/ubuntu-maintenance-v0.4.8.sh
+curl -fL --retry 3 -o ubuntu-maintenance-v0.4.9.sh https://raw.githubusercontent.com/vaisaldarmawan/updatephpandnodejs/main/ubuntu-maintenance-v0.4.9.sh
 ```
+
+**Upload file versi 0.4.9 ke branch `main` GitHub lebih dahulu** agar URL di atas tersedia.
 
 ## 2. Audit
 
 ```bash
-sudo bash ubuntu-maintenance-v0.4.8.sh --audit
+sudo bash ubuntu-maintenance-v0.4.9.sh --audit
 ```
 
-Memeriksa IP, user, CPU/RAM/disk, versi PHP/Node, PM2/systemd/proses Node, serta web/port menggunakan IP lokal server. Laporan aplikasi Node kosong ditulis `N/A`.
+Memeriksa user, IP lokal/publik, CPU/RAM/disk, PHP/Node.js, proses Node/PM2/systemd, port/URL web dan status runtime `STALE`. Tidak mengubah paket atau restart service.
 
 ## 3. Apply
 
 ```bash
-sudo bash ubuntu-maintenance-v0.4.8.sh --apply
+sudo bash ubuntu-maintenance-v0.4.9.sh --apply
 ```
 
-Menghentikan service terkelola yang terdeteksi, memperbarui paket APT, mencoba migrasi Node sistem ke **24.x LTS**, dan migrasi **PHP CLI ke 8.5.x** jika PHP sudah terpasang. Jika PHP 8.5 belum tersedia, skrip menambahkan `ppa:ondrej/php` melalui Launchpad, memperbarui indeks APT, menyimulasikan instalasi (menolak penghapusan paket), memasang ekstensi yang setara, serta memilih interpreter PHP baru setelah memeriksa modul. Sesudahnya service yang sebelumnya aktif dijalankan kembali, Nginx/Apache lokal direstart setelah uji konfigurasi, lalu port/URL dan runtime diperiksa.
+Mencoba menghentikan service yang dapat dikelola, upgrade APT, migrasi Node bawaan Ubuntu/NodeSource ke **Node 24 LTS** jika tersedia, migrasi PHP CLI terpasang ke **PHP 8.5** bila kompatibel, menghidupkan service lagi, restart Nginx/Apache aktif, dan memverifikasi versi serta HTTP. Server tanpa PHP/Node tidak akan dipasangi runtime yang sebelumnya tidak ada.
 
-**Peringatan penting untuk PHP:** Skrip dapat menambahkan **PPA pihak ketiga** (`ppa:ondrej/php`), sehingga paket PHP berikutnya dapat berasal dari pengelola PPA, bukan repositori Canonical. PHP.net memberi peringatan bahwa build pihak ketiga ini memuat perubahan dari penyedia, termasuk patch telemetry pada modul Apache 2 dan PHP-FPM. Pastikan organisasi Anda menyetujui sumber paket tersebut. Untuk situs PHP-FPM/mod_php yang telah menggunakan socket, pool, atau vhost lama, **skrip memasang PHP 8.5 tetapi tidak mengubah konfigurasi web secara membabi buta**. Situs dapat tetap melayani PHP lama sampai migrasi handler diselesaikan; status akan `REVIEW`, bukan klaim seluruh web sudah PHP 8.5. Ekstensi pihak ketiga seperti ionCube juga perlu diverifikasi terpisah. Siapkan snapshot VM/backup, dan gunakan maintenance window.
-
-**Peringatan Node.js:** Migrasi major dapat memerlukan perubahan dependency aplikasi. Skrip mendukung paket Node Ubuntu/NodeSource dan memverifikasi rencana APT, tetapi **tidak otomatis meng-upgrade NVM/custom binary**. Proses tanpa supervisor tidak dapat dijamin restart. Untuk percobaan restart paksa proses tersebut, tambahkan `--force-restart-unmanaged` hanya setelah memeriksa risiko Screen/Tmux, environment, dan logging.
-
-Opsional pengecekan URL tambahan (tanpa file konfigurasi):
+**Khusus aplikasi Node mandiri** (Screen/Tmux/proses tanpa PM2/systemd) yang *sudah jelas bisa dijalankan ulang*, Anda boleh memilih opsi:
 
 ```bash
-sudo bash ubuntu-maintenance-v0.4.8.sh --audit --check-url http://10.0.0.126:3000/
+sudo bash ubuntu-maintenance-v0.4.9.sh --apply --force-restart-unmanaged
 ```
 
-`--apply` dapat meng-upgrade paket Ubuntu lain, menyebabkan downtime, dan **tidak memiliki rollback otomatis** untuk seluruh sistem. HTTP 2xx/3xx berarti endpoint merespons, bukan jaminan database/queue atau aplikasi sehat secara keseluruhan.
+Opsi ini berisiko: proses dijalankan ulang di luar sesi Screen/Tmux semula, dan stdout/stderr diarahkan ke `/dev/null`. Jangan gunakan tanpa snapshot/backup dan maintenance window. Bila startup tidak dapat direkonstruksi, proses tidak akan dihentikan.
 
-[Repository GitHub](https://github.com/vaisaldarmawan/updatephpandnodejs)
+### Perbaikan 0.4.9
+
+Migrasi Node.js 18 bawaan Ubuntu ke NodeSource 24 tidak lagi otomatis gagal hanya karena APT perlu melepas `node-css-loader` atau modul `node-*` yang terinstal sebagai dependensi otomatis. **Setiap rencana penghapusan diperiksa:** penggantian paket Node build tooling yang diizinkan akan ditampilkan; penghapusan `nginx`, service Node, atau paket tidak dikenal tetap membatalkan migrasi. Tooling Ubuntu yang dilepas bisa perlu dipasang lagi sebagai dependensi proyek (`npm install`) bila memang digunakan dalam alur build.
+
+### Penting
+
+- Upgrade major bisa membuat aplikasi tidak kompatibel. Pengujian HTTP 200/302 hanya menunjukkan web merespons, bukan bahwa seluruh fungsi aplikasi sehat.
+- `--apply` juga meng-upgrade paket Ubuntu lainnya, yang dapat memicu perubahan service, kernel, dan kebutuhan reboot. Tidak ada rollback otomatis paket OS.
+- NodeSource dan `ppa:ondrej/php` (jika diperlukan) adalah sumber paket pihak ketiga. Migrasi handler/socket PHP-FPM yang tidak bisa diverifikasi tetap membutuhkan tindakan manual.
+- Jika APT mengusulkan penghapusan paket aplikasi lain, skrip **sengaja gagal** daripada menggunakan `--force-yes` atau menghapusnya diam-diam.
+
+[GitHub repository](https://github.com/vaisaldarmawan/updatephpandnodejs)
