@@ -5,8 +5,9 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-SCRIPT_VERSION='0.4.9'
+SCRIPT_VERSION='0.5.0'
 MODE='audit'
+RUNTIME_ONLY=0
 ALLOW_CONTAINER=0
 UPDATE_NVM=0
 NVM_UPDATED=0
@@ -33,6 +34,13 @@ NVM_PRESENT=0
 NODE_LTS=0
 AUTO_LTS=1
 NODE_LTS_MAJOR=24
+NODE_RELEASE='24.22.1'
+NODE_APT_HOLD_ADDED=0
+NODE_DIRECT_INSTALLED=0
+NODE_DIRECT_TRANSACTION=0
+NODE_DIRECT_PATHS=()
+NODE_DIRECT_DIVERTED=()
+NODE_DIRECT_OLD_LINKS=()
 PHP_STABLE_SERIES='8.5'
 PHP_MIGRATED=0
 NODE_LTS_SKIPPED=0
@@ -61,19 +69,20 @@ FORCE_UNMANAGED_COUNT=0
 
 usage() {
 cat <<'HELP'
-Ubuntu Maintenance v0.4.9 — terminal-only (no report upload or saved logs)
+Ubuntu Maintenance v0.5.0 — terminal-only (no report upload or saved logs)
 
-  bash ubuntu-maintenance-v0.4.9.sh --audit             # regular user or root
-  sudo bash ubuntu-maintenance-v0.4.9.sh --audit        # fuller host inventory
-  bash ubuntu-maintenance-v0.4.9.sh --demo              # simulated terminal view
-  sudo bash ubuntu-maintenance-v0.4.9.sh --apply        # stop managed apps, upgrade runtimes, start and verify
+  bash ubuntu-maintenance-v0.5.0.sh --audit             # regular user or root
+  sudo bash ubuntu-maintenance-v0.5.0.sh --audit        # fuller host inventory
+  bash ubuntu-maintenance-v0.5.0.sh --demo              # simulated terminal view
+  sudo bash ubuntu-maintenance-v0.5.0.sh --apply        # stop managed apps, upgrade runtimes, start and verify
 
 Options:
   --audit                 Read-only inventory (default), supports non-root/container
   --apply                 Stop managed PHP/Node apps, upgrade runtimes, start apps, verify
   --allow-container-apply Explicitly permit APT inside container (no auto restarts)
   --update-nvm            Update NVM default within its existing major (optional)
-  --node-lts              Require Node 24 LTS migration, including Ubuntu APT -> NodeSource
+  --node-lts              Require Node 24 LTS installation from official binary
+  --runtime-only          Skip general apt-get update/upgrade; Node uses direct official binary. PHP (if installed) still needs APT/PPA.
   --no-restart            Skip automatic PHP/Node stop/start and local web-server restart
   --force-restart-unmanaged
                          Force stop/start standalone Node processes using original
@@ -87,15 +96,15 @@ Options:
   -h, --help              Show this help
 
 Important:
-* APT upgrades Ubuntu-packaged Node via verified NodeSource 24.x if installed; it does NOT upgrade NVM/asdf/fnm,
-  Docker images, or binaries installed manually. This adds a third-party NodeSource APT repository for Ubuntu Node 18/20/22, after checking signing keys and package-removal simulations. PHP 8.5 can configure the third-party ppa:ondrej/php on supported Ubuntu when missing; review provider trust and compatibility first.
+* Node upgrades from an official nodejs.org Linux binary (verified SHA256), NOT APT; Ubuntu's webpack/eslint/terser packages are left installed. The original /usr/bin/node (and npm/npx where present) is protected with dpkg-divert, allowing restoration. Container images, NVM/asdf/fnm installations are not overwritten.
+* PHP 8.5 uses signed apt packages (ppa:ondrej/php on supported Ubuntu if needed), because upstream does not distribute a universal production Linux PHP-FPM binary. PHP FPM/socket migrations are not automatically assumed safe.
 * Root manages PM2 as each owning user with its own HOME/PM2_HOME (not the root PM2 list). PM2 installations with custom PM2_HOME need manual handling.
 * Managed PHP/Node systemd services and online PM2 apps are stopped before changing packages and started afterward, including recovery attempts on failure. Local active Nginx/Apache is restarted after apps start, if its configuration test passes.
 * --force-restart-unmanaged (explicit opt-in) captures startup argv/cwd/env for standalone Node apps, terminates them and starts detached copies as the original user. This CHANGES Screen/Tmux behavior and redirects future stdout/stderr to /dev/null; interactive apps, dynamic startup wrappers and nonpersistent dependencies can fail. If metadata cannot be captured, the script aborts before stopping any app. Prefer systemd/PM2 for production.
 * A process with /proc/PID/exe marked (deleted), or an executable inode different from the current binary, is reported STALE on every run (audit and apply), including when APT changed no packages.
 * PHP 8.5 CLI + matching installed extensions are upgraded using APT (ppa:ondrej/php if needed). Active PHP-FPM virtual hosts are NOT blindly rewritten: old FPM remains serving until independently migrated; report will flag pending FPM cutover. Third-party PPA may use provider-specific changes/telemetry.
 * Apply needs no configuration file; HTTP GET is checked on identified local TCP ports and optional --check-url values. HTTP response checks do not guarantee database/queue functionality. During the stop→start window, monitored applications may be unavailable.
-* No automatic reboot, rollback, or container orchestration actions.
+* No automatic reboot, complete runtime rollback, or container orchestration actions. Review changed systemd interpreter paths and PHP virtual hosts.
 * apt-get itself can restart services before our controlled restart phase.
 * Only terminal text is output; an internal temporary directory is removed on exit.
 HELP
@@ -104,7 +113,7 @@ HELP
 demo() {
 cat <<'DEMO'
 ╔════════════════════════════════════════════════════════════════════╗
-║  UBUNTU MAINTENANCE v0.4.9 • SIMULASI (BUKAN HASIL SERVER ASLI)   ║
+║  UBUNTU MAINTENANCE v0.5.0 • SIMULASI (BUKAN HASIL SERVER ASLI)   ║
 ╚════════════════════════════════════════════════════════════════════╝
 [15:08:21] Mode              : APPLY
 [15:08:21] Hostname          : prod-api-01
@@ -140,8 +149,10 @@ cat <<'DEMO'
 [15:08:27] Stop Node deploy/admin    [done] (opsional: --force-restart-unmanaged)
 
 ──── [05] UPGRADE RUNTIME & PAKET ────
-[15:08:30] Apt Update               [done]
-[15:08:38] Node 24 LTS Upgrade      [done]
+[15:08:43] Apt Update               [done]
+[15:08:38] Node Official Download     [done]
+[15:08:39] Node SHA256 Check         [done]
+[15:08:41] Node Binary Activate      [done]
 [15:08:53] Apt Upgrade              [done]
 [15:08:59] PHP Stable Check         [done]
 
@@ -157,7 +168,7 @@ cat <<'DEMO'
   Login / eksekusi   : deploy / root
   IP lokal / publik  : 192.168.10.20 / 203.0.113.20
   PHP               : 8.5.12 -> 8.5.12
-  Node.js (APT)     : v20.20.2 -> v24.22.1
+  Node.js           : v20.20.2 -> v24.22.1
   CPU / RAM / Disk  : 12.8% | 3.20 / 8.00 GiB | 58.00 / 100.00 GiB free
   Node apps         : api.service [active], webhook [online]
   Status aplikasi   : 2 aktif / 0 gagal (level proses)
@@ -175,6 +186,7 @@ while (( $# > 0 )); do
     --allow-container-apply) ALLOW_CONTAINER=1 ;;
     --update-nvm) UPDATE_NVM=1 ;;
     --node-lts) NODE_LTS=1; AUTO_LTS=0 ;;
+    --runtime-only) RUNTIME_ONLY=1 ;;
     --no-restart) RESTART=0 ;;
     --force-restart-unmanaged) FORCE_UNMANAGED=1 ;;
     --no-public-ip) PUBLIC_IP_LOOKUP=0 ;;
@@ -199,6 +211,10 @@ for weburl in "${CHECK_URLS[@]}"; do
 done
 if ((FORCE_UNMANAGED)) && { [[ $MODE != apply ]] || ((RESTART==0)); }; then
   printf '%s\n' '--force-restart-unmanaged requires --apply without --no-restart' >&2
+  exit 64
+fi
+if ((RUNTIME_ONLY)) && [[ $MODE != apply ]]; then
+  printf '%s\n' '--runtime-only requires --apply' >&2
   exit 64
 fi
 if ((NODE_LTS)) && [[ $MODE != apply ]]; then
@@ -227,6 +243,21 @@ cleanup() {
   if (( STOP_PHASE_ENTERED == 1 && START_PHASE_DONE == 0 )) && declare -F bring_back_managed >/dev/null 2>&1; then
     printf '\n[RECOVERY] Upaya menghidupkan kembali service/aplikasi yang dihentikan...\n' >&2
     bring_back_managed || true
+  fi
+  if ((NODE_APT_HOLD_ADDED == 1)); then
+    apt-mark unhold nodejs >/dev/null 2>&1 || printf 'WARNING: gagal unhold nodejs; jalankan apt-mark unhold nodejs\n' >&2
+  fi
+  if ((NODE_DIRECT_TRANSACTION == 1 && NODE_DIRECT_INSTALLED == 0)); then
+    printf '[RECOVERY] Memulihkan Node binary yang tidak selesai diaktifkan...\n' >&2
+    for ((j=${#NODE_DIRECT_PATHS[@]}-1; j>=0; j--)); do
+      path=${NODE_DIRECT_PATHS[j]}
+      rm -f -- "$path"
+      if [[ ${NODE_DIRECT_DIVERTED[j]} == yes ]]; then
+        dpkg-divert --local --rename --remove "$path" >/dev/null 2>&1 || printf 'WARNING: diversion %s perlu diperbaiki manual\n' "$path" >&2
+      elif [[ -n ${NODE_DIRECT_OLD_LINKS[j]} ]]; then
+        ln -s "${NODE_DIRECT_OLD_LINKS[j]}" "$path" || true
+      fi
+    done
   fi
   if (( NODE_MAJOR_INSTALLED == 0 )); then
     if (( NODE_SOURCE_SWITCHED == 1 )) && [[ -n $NODE_SOURCE_FILE && -f $NODE_SOURCE_BACKUP ]]; then
@@ -1291,265 +1322,112 @@ bring_back_managed() {
   return 0
 }
 
-# Add NodeSource 24.x for a system-packaged Node installation when Ubuntu's own
-# repo only offers 18.x. Never execute a downloaded shell script as root.
-# Repo and key are reverted on failure before the Node package is changed.
-node_repo_track_write() {
-  local dest=$1 backup
-  if [[ -e $dest ]]; then
-    backup="$TMP/node-repo-backup-${#NODE_REPO_BACKUP_PATHS[@]}"
-    cp -p -- "$dest" "$backup" || return 1
-    NODE_REPO_BACKUP_PATHS+=("$dest")
-    NODE_REPO_BACKUP_FILES+=("$backup")
+# Official Node.js binary installer: avoids apt package dependency removals.
+# The Node package from Ubuntu is kept under /usr/bin/node.distrib by dpkg-divert.
+# Runtime processes are stopped before activation and checked after restart.
+node_official_install() {
+  local arch filename base target release_url metadata key expected actual bin link_path old_link entry
+  local -a commands=('node' 'npm' 'npx')
+  command -v curl >/dev/null && command -v tar >/dev/null && command -v sha256sum >/dev/null && command -v dpkg-divert >/dev/null || {
+    err 'Node official binary membutuhkan curl, tar, sha256sum, dan dpkg-divert.'; return 1;
+  }
+  case "$(uname -m)" in
+    x86_64) arch=x64 ;;
+    aarch64|arm64) arch=arm64 ;;
+    *) err "Node official tidak tersedia untuk arsitektur $(uname -m); upgrade dihentikan."; return 1 ;;
+  esac
+  filename="node-v${NODE_RELEASE}-linux-${arch}.tar.xz"
+  base="https://nodejs.org/dist/v${NODE_RELEASE}"
+  target="/opt/ubuntu-maintenance/node-v${NODE_RELEASE}-linux-${arch}"
+  local managed_flag="/opt/ubuntu-maintenance/.node-binary-managed"
+  section 'NODE.JS OFFICIAL BINARY (TANPA APT NODE)'
+  if [[ -x "$target/bin/node" ]] && [[ "$("$target/bin/node" -v 2>/dev/null)" == "v$NODE_RELEASE" ]]; then
+    ok "Binary Node.js $NODE_RELEASE sudah tersedia; memeriksa aktivasi."
   else
-    NODE_REPO_CREATED_PATHS+=("$dest")
-  fi
-}
-
-install_ubuntu_nodesource_repo() {
-  local arch path keyurl cmd key_fingerprint
-  arch=$(dpkg --print-architecture 2>/dev/null || true)
-  if [[ $arch != amd64 && $arch != arm64 ]]; then
-    err "NodeSource 24.x: arsitektur $arch tidak didukung oleh setup resmi (amd64/arm64)."
-    return 1
-  fi
-  for cmd in curl gpg install apt-cache apt-get dpkg; do
-    command -v "$cmd" >/dev/null 2>&1 || { err "NodeSource memerlukan utilitas: $cmd"; return 1; }
-  done
-  # Do not overwrite a source or key managed by a different installation.
-  for path in /etc/apt/sources.list.d/nodesource.list /etc/apt/sources.list.d/nodesource.sources; do
-    if [[ -e $path ]]; then
-      err "File $path sudah ada dengan format repo tidak dikenali; tidak akan ditimpa."
-      return 1
-    fi
-  done
-  keyurl='https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key'
-  if ! run_quiet 'NodeSource Key Download' curl -fsSL --proto '=https' --tlsv1.2 --connect-timeout 8 --max-time 40 -o "$TMP/nodesource-key.asc" "$keyurl"; then
-    return 1
-  fi
-  if ! gpg --batch --yes --dearmor -o "$TMP/nodesource-key.gpg" "$TMP/nodesource-key.asc" >"$TMP/nodesource-gpg.log" 2>&1 || [[ ! -s $TMP/nodesource-key.gpg ]]; then
-    err 'Gagal mengimpor kunci GPG NodeSource (bukan keyring valid).'
-    return 1
-  fi
-  # Match official NodeSource public key (do not trust an arbitrary key).
-  # A future key rotation must be reviewed and explicitly updated.
-  if ! gpg --batch --show-keys --with-colons "$TMP/nodesource-key.gpg" >"$TMP/nodesource-key-info" 2>/dev/null; then
-    err 'NodeSource signing key tidak bisa diverifikasi.'
-    return 1
-  fi
-  key_fingerprint=$(awk -F: '$1=="fpr" {print $10;exit}' "$TMP/nodesource-key-info")
-  if [[ $key_fingerprint != 6F71F525282841EEDAF851B42F59B5F99B1BE0B4 ]]; then
-    err "Fingerprint GPG NodeSource tidak dikenal ($key_fingerprint). Repository tidak ditambahkan."
-    return 1
-  fi
-  mkdir -p /usr/share/keyrings /etc/apt/preferences.d /etc/apt/sources.list.d
-  NODE_NEW_REPO=1
-  for path in /usr/share/keyrings/nodesource.gpg /etc/apt/sources.list.d/nodesource.sources /etc/apt/preferences.d/nodejs; do
-    node_repo_track_write "$path" || { err "Gagal backup $path"; return 1; }
-  done
-  install -m 0644 "$TMP/nodesource-key.gpg" /usr/share/keyrings/nodesource.gpg || return 1
-  cat > /etc/apt/sources.list.d/nodesource.sources <<EOF
-Types: deb
-URIs: https://deb.nodesource.com/node_${NODE_LTS_MAJOR}.x
-Suites: nodistro
-Components: main
-Architectures: $arch
-Signed-By: /usr/share/keyrings/nodesource.gpg
-EOF
-  cat > /etc/apt/preferences.d/nodejs <<'EOF'
-Package: nodejs
-Pin: origin deb.nodesource.com
-Pin-Priority: 600
-EOF
-  chmod 0644 /etc/apt/sources.list.d/nodesource.sources /etc/apt/preferences.d/nodejs
-  log "NodeSource: Node Ubuntu → Node ${NODE_LTS_MAJOR}.x LTS (repo HTTPS + signed-by keyring)."
-  return 0
-}
-
-# NodeSource major migration is part of --apply when its repository is recognized.
-# Only modify the single recognized NodeSource APT source (its signing key stays unchanged).
-prepare_nodesource_lts() {
-  local candidate file source_count=0 mgr user name status pid exe old_major new_content
-  command -v dpkg-query >/dev/null 2>&1 || { err 'dpkg-query tidak tersedia.'; return 1; }
-  [[ -x /usr/bin/node ]] || { err '--node-lts memerlukan instalasi Node.js sistem di /usr/bin/node.'; return 1; }
-  candidate=$(dpkg-query -W -f='${Version}' nodejs 2>/dev/null || true)
-  [[ -n $candidate ]] || { err '--node-lts hanya mendukung Node.js paket APT/NodeSource.'; return 1; }
-  old_major=$(/usr/bin/node -p 'process.versions.node.split(".")[0]' 2>/dev/null || true)
-  [[ $old_major =~ ^[0-9]+$ ]] || { err 'Versi Node sistem tidak dapat diperiksa.'; return 1; }
-  if (( old_major > NODE_LTS_MAJOR )); then
-    err "Node $old_major lebih baru daripada LTS $NODE_LTS_MAJOR; tidak melakukan downgrade otomatis."
-    return 1
-  fi
-  if [[ $old_major == "$NODE_LTS_MAJOR" ]]; then
-    log "Node.js sudah di cabang LTS $NODE_LTS_MAJOR.x. Upgrade patch tetap melalui APT."
-    return 0
-  fi
-  # Do not stop a bare process; upgrading an installed binary does not replace
-  # the interpreter of an already running application. Surface that fact later.
-  while IFS='|' read -r mgr user name status pid exe; do
-    [[ $mgr == process && $exe == /usr/bin/node* ]] || continue
-    if [[ -s $TMP/pm2-before ]] && awk -F '|' -v p="$pid" '$4==p {f=1} END{exit !f}' "$TMP/pm2-before"; then continue; fi
-    UNMANAGED_NODE_UPGRADE=1
-  done < "$TMP/node-apps-before"
-  if (( UNMANAGED_NODE_UPGRADE )) && (( !FORCE_UNMANAGED )); then
-    warn 'Ada proses Node tanpa supervisor: runtime paket tetap di-upgrade tetapi proses memerlukan restart manual.'
-  fi
-  for file in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
-    [[ -f $file ]] || continue
-    if grep -Eq 'deb\.nodesource\.com/node_[0-9]+\.x' "$file"; then
-      NODE_SOURCE_FILE=$file
-      source_count=$((source_count+1))
-    fi
-  done
-  if ((source_count == 0)); then
-    # Ubuntu default package (e.g. 18.19.1+dfsg-6ubuntu5).
-    # Force the requested upgrade by configuring a signed NodeSource LTS repo.
-    install_ubuntu_nodesource_repo
-    return $?
-  elif ((source_count != 1)); then
-    err "Ditemukan $source_count file repository NodeSource; diharapkan maksimal satu."
-    return 1
-  fi
-  if [[ ! -w $NODE_SOURCE_FILE ]]; then err "Source APT tidak dapat ditulis: $NODE_SOURCE_FILE"; return 1; fi
-  NODE_SOURCE_BACKUP="$TMP/nodesource.original"
-  cp -p -- "$NODE_SOURCE_FILE" "$NODE_SOURCE_BACKUP"
-  sed -E "s|https?://deb\\.nodesource\\.com/node_[0-9]+\\.x|https://deb.nodesource.com/node_${NODE_LTS_MAJOR}.x|g" "$NODE_SOURCE_BACKUP" > "$TMP/nodesource.updated"
-  if cmp -s "$TMP/nodesource.updated" "$NODE_SOURCE_BACKUP"; then
-    err 'Repository NodeSource tidak berubah; format tidak dikenal.'
-    return 1
-  fi
-  cat "$TMP/nodesource.updated" > "$NODE_SOURCE_FILE"
-  NODE_SOURCE_SWITCHED=1
-  log "NodeSource: cabang $old_major.x → $NODE_LTS_MAJOR.x (LTS; upgrade dari --apply)."
-}
-
-# Validate the APT transaction BEFORE modifying installed Node. Ubuntu's
-# individually packaged JS build modules often conflict with the NodeSource
-# nodejs package, which bundles npm. Never permit general package removals.
-node_lts_validate_removals() {
-  local plan=$1 line pkg count=0
-  local blocked=() allowed=()
-  NODE_APT_ALLOWED_REMOVALS=()
-  : > "$TMP/node-planned-removals"
-  if command -v apt-mark >/dev/null 2>&1; then
-    apt-mark showauto > "$TMP/node-auto-packages" 2>/dev/null || : > "$TMP/node-auto-packages"
-  else
-    : > "$TMP/node-auto-packages"
-  fi
-  while IFS= read -r line; do
-    [[ $line == 'Remv '* ]] || continue
-    pkg=${line#Remv }; pkg=${pkg%% *}
-    [[ -n $pkg ]] || continue
-    printf '%s\n' "$pkg" >> "$TMP/node-planned-removals"
-    count=$((count+1))
-    case "$pkg" in
-      npm|nodejs-doc|libnode-dev|node-css-loader)
-        allowed+=("$pkg")
-        ;;
-      node-*)
-        # Auto-installed Ubuntu Node libraries can normally be replaced by
-        # per-project npm dependencies. Do not auto-remove Node-based services,
-        # and do not auto-remove manually installed Node application packages.
-        case "$pkg" in
-          node-red|node-red-*|node-exporter*|node-forever|node-pm2|node-supervisor)
-            blocked+=("$pkg") ;;
-          *)
-            if grep -Fxq -- "$pkg" "$TMP/node-auto-packages"; then
-              allowed+=("$pkg")
-            else
-              blocked+=("$pkg")
-            fi
-            ;;
-        esac
-        ;;
-      *) blocked+=("$pkg") ;;
+    if ! run_quiet 'Node Official Download' curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --connect-timeout 10 --max-time 240 -o "$TMP/$filename" "$base/$filename"; then return 1; fi
+    if ! run_quiet 'Node SHA256 Download' curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --connect-timeout 10 --max-time 40 -o "$TMP/SHASUMS256.txt" "$base/SHASUMS256.txt"; then return 1; fi
+    metadata=$(awk -v f="$filename" '$2==f {print $1}' "$TMP/SHASUMS256.txt")
+    [[ $metadata =~ ^[0-9a-f]{64}$ ]] || { err 'SHA256 official tidak ditemukan; arsip Node ditolak.'; return 1; }
+    # Independent, pinned digest from the Node.js official v24.22.1 release.
+    # Protects against a malicious mirror returning both altered tarball and manifest.
+    case "$arch" in
+      x64) expected=6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fcce2aa77095e6 ;;
+      arm64) expected=9ce5728445016b29e49ad098f7a336061aa5f770d177d927278bc26fd626e643 ;;
     esac
-  done < "$plan"
-  if (( ${#blocked[@]} > 0 )); then
-    local blocked_text
-    blocked_text=$(printf '%s, ' "${blocked[@]}")
-    blocked_text=${blocked_text%, }
-    err "Node LTS: rencana APT ingin menghapus paket yang belum disetujui: $blocked_text. Upgrade Node dibatalkan."
-    log 'Periksa dependensi paket tersebut; tidak akan menjalankan apt dengan --force-yes atau membuangnya diam-diam.'
-    return 1
-  fi
-  if ((count>0)); then
-    NODE_APT_ALLOWED_REMOVALS=("${allowed[@]}")
-    local allowed_text
-    allowed_text=$(printf '%s, ' "${allowed[@]}")
-    allowed_text=${allowed_text%, }
-    warn "Migrasi Node: APT akan melepas ${count} paket modul/tooling Ubuntu: $allowed_text."
-    log 'Catatan: tooling build Ubuntu yang dilepas mungkin perlu dipasang ulang sebagai dependensi proyek via npm.'
-  fi
-  return 0
-}
-
-node_lts_install() {
-  local candidate major installed_pkg pkg
-  candidate=$(awk '$1=="Candidate:" {print $2}' "$TMP/node-apt-policy")
-  major=$(printf '%s\n' "${candidate#*:}" | awk -F'.' '$1~/^[0-9]+$/ {print $1}')
-  if [[ $major != "$NODE_LTS_MAJOR" ]]; then
-    err "NodeSource tidak menyediakan kandidat $NODE_LTS_MAJOR.x ($candidate). Repository akan dipulihkan."
-    return 1
-  fi
-  installed_pkg=$(dpkg-query -W -f='${Version}' nodejs 2>/dev/null || true)
-  if [[ -n $installed_pkg ]] && dpkg --compare-versions "$installed_pkg" ge "$candidate"; then
-    log "Node LTS ${NODE_LTS_MAJOR}.x: paket sudah versi terkini ($installed_pkg)."
-    return 0
-  fi
-  NODE_LTS_APT_ARGS=('nodejs')
-  if (( NODE_NEW_REPO == 1 )); then
-    # NodeSource bundles npm; Ubuntu's separately packaged npm/docs/headers
-    # must be removed explicitly to avoid dpkg file collisions.
-    for pkg in npm nodejs-doc libnode-dev; do
-      if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q '^install ok installed$'; then
-        NODE_LTS_APT_ARGS+=("${pkg}-")
-      fi
-    done
-  fi
-  if ! env DEBIAN_FRONTEND=noninteractive apt-get -s install "${NODE_LTS_APT_ARGS[@]}" > "$TMP/node-install-plan" 2>&1; then
-    err 'Simulasi APT untuk Node 24 gagal. Paket tidak diubah; periksa konflik versi dan dependensi.'
-    return 1
-  fi
-  if ! node_lts_validate_removals "$TMP/node-install-plan"; then
-    return 1
-  fi
-  # Verify the simulated transaction installs Node 24, not just leaves Node 18.
-  if ! grep -Eq '^Inst nodejs .*24\.' "$TMP/node-install-plan" &&
-     ! grep -Eq '^Inst nodejs .*\(24\.' "$TMP/node-install-plan"; then
-    err 'Rencana APT tidak menunjukkan pemasangan Node 24.x; upgrade dibatalkan.'
-    return 1
-  fi
-  # dpkg may now change the major. Preserve new repo if installation partially
-  # succeeds; blindly restoring the old repo would make recovery more difficult.
-  NODE_MAJOR_INSTALLED=1
-  if ! run_quiet 'Node LTS Upgrade' env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none NEEDRESTART_MODE=l apt-get -qq -o DPkg::Lock::Timeout=60 -o Dpkg::Options::=--force-confold -y install "${NODE_LTS_APT_ARGS[@]}"; then
-    return 1
-  fi
-  major=$(/usr/bin/node -p 'process.versions.node.split(".")[0]' 2>/dev/null || true)
-  if [[ $major != "$NODE_LTS_MAJOR" ]]; then
-    err "Node.js sesudah instalasi bukan $NODE_LTS_MAJOR.x; periksa status dpkg dan binary."
-    return 1
-  fi
-  if ! command -v npm >/dev/null 2>&1 || ! npm -v > "$TMP/node-npm-version" 2>&1; then
-    err 'Node LTS terpasang tetapi npm tidak dapat dijalankan. Periksa paket NodeSource sebelum melanjutkan.'
-    return 1
-  fi
-  if [[ -s $TMP/node-planned-removals ]]; then
-    local missing=() removed=()
-    while IFS= read -r pkg; do
-      if ! dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q '^install ok installed$'; then
-        removed+=("$pkg")
-      fi
-    done < "$TMP/node-planned-removals"
-    if (( ${#removed[@]} > 0 )); then
-      local removed_text
-      removed_text=$(printf '%s, ' "${removed[@]}")
-      removed_text=${removed_text%, }
-      warn "Paket distribusi yang benar-benar dilepas: $removed_text."
+    actual=$(sha256sum "$TMP/$filename" | awk '{print $1}')
+    [[ $metadata == "$actual" && $actual == "$expected" ]] || { err 'Checksum Node official TIDAK cocok dengan manifest dan digest rilis resmi! Arsip ditolak.'; return 1; }
+    ok 'Node SHA256: cocok dengan manifest nodejs.org'
+    mkdir -p /opt/ubuntu-maintenance || return 1
+    local stage="$TMP/node-stage"
+    mkdir -p "$stage"
+    if ! tar -xJf "$TMP/$filename" -C "$stage" --no-same-owner; then err 'Ekstraksi Node gagal'; return 1; fi
+    [[ -x "$stage/node-v${NODE_RELEASE}-linux-${arch}/bin/node" ]] || { err 'Arsip Node tidak memuat executable'; return 1; }
+    if [[ "$("$stage/node-v${NODE_RELEASE}-linux-${arch}/bin/node" -v 2>/dev/null)" != "v$NODE_RELEASE" ]]; then
+      err 'Binary Node yang diunduh gagal dieksekusi/versi berbeda'; return 1
     fi
+    if [[ ! -d $target ]]; then mv "$stage/node-v${NODE_RELEASE}-linux-${arch}" "$target" || return 1; fi
   fi
-  ok "Node.js LTS $NODE_LTS_MAJOR.x dan npm $(cat "$TMP/node-npm-version") terpasang; aplikasi akan divalidasi terpisah."
+  # The script runs with umask 077. Applications owned by non-root users
+  # must still be able to read and execute Node and its npm JS modules.
+  chmod 755 /opt/ubuntu-maintenance || return 1
+  chmod -R a+rX "$target" || return 1
+  # Preflight entire diversion transaction before modifying /usr/bin.
+  for bin in "${commands[@]}"; do
+    link_path="/usr/bin/$bin"
+    [[ -e "$target/bin/$bin" || -L "$target/bin/$bin" ]] || { err "Node bundle tidak memiliki $bin"; return 1; }
+    if [[ -e "$link_path" || -L "$link_path" ]]; then
+      entry=$(dpkg-divert --list "$link_path")
+      if [[ -n $entry && $entry != *'local diversion of'* ]]; then
+        err "Diversion $link_path milik paket lain; tidak ditimpa."; return 1
+      fi
+      if [[ -n $entry && ! -f $managed_flag ]]; then
+        err "Diversion $link_path sudah ada tetapi bukan milik skrip ini; dibatalkan."; return 1
+      fi
+      if [[ -n $entry && ! -L $link_path ]]; then
+        err "Diverted $link_path bukan symlink; intervensi manual diperlukan."; return 1
+      fi
+      if [[ -z $entry && -L $link_path ]]; then
+        # Original symlinks are preserved in .distrib using dpkg-divert.
+        :
+      fi
+    fi
+  done
+  NODE_DIRECT_TRANSACTION=1
+  for bin in "${commands[@]}"; do
+    link_path="/usr/bin/$bin"
+    old_link=''
+    entry=$(dpkg-divert --list "$link_path")
+    if [[ -n $entry ]]; then
+      [[ -L $link_path ]] && old_link=$(readlink "$link_path" || true)
+      NODE_DIRECT_PATHS+=("$link_path")
+      NODE_DIRECT_DIVERTED+=(no)
+      NODE_DIRECT_OLD_LINKS+=("$old_link")
+      rm -f -- "$link_path" || return 1
+    else
+      NODE_DIRECT_PATHS+=("$link_path")
+      NODE_DIRECT_DIVERTED+=(yes)
+      NODE_DIRECT_OLD_LINKS+=('')
+      if ! dpkg-divert --local --rename --add "$link_path" >"$TMP/divert-$bin.log" 2>&1; then
+        # This diversion may not have been registered. Drop the last
+        # recovery entry instead of removing an unrelated package file.
+        unset 'NODE_DIRECT_PATHS[-1]' 'NODE_DIRECT_DIVERTED[-1]' 'NODE_DIRECT_OLD_LINKS[-1]'
+        err "Gagal melindungi $link_path via dpkg-divert"; return 1
+      fi
+    fi
+    ln -s "$target/bin/$bin" "$link_path" || return 1
+  done
+  if [[ "$(/usr/bin/node -v 2>/dev/null)" != "v$NODE_RELEASE" ]] || ! /usr/bin/npm -v >"$TMP/npm-verified" 2>&1; then
+    err 'Validasi Node/npm gagal. Node binary akan dicoba dipulihkan.'; return 1
+  fi
+  printf '%s\n' "v${NODE_RELEASE}" > "$managed_flag" || return 1
+  chmod 644 "$managed_flag" || return 1
+  NODE_DIRECT_INSTALLED=1
+  NODE_MAJOR_INSTALLED=1
+  NODE_CHANGED=1
+  ok "Node.js v$NODE_RELEASE aktif di /usr/bin/node (source: official tarball)"
+  ok "npm $(cat "$TMP/npm-verified") aktif di /usr/bin/npm"
+  warn 'Binary Node Ubuntu lama dipertahankan melalui dpkg-divert (/usr/bin/node.distrib). Upgrade paket Node APT tidak menyentuh binary aktif.'
+  return 0
 }
 
 if [[ $MODE == apply ]]; then
@@ -1573,87 +1451,40 @@ if [[ $MODE == apply ]]; then
     fi
   fi
   if ((APPLY_ABORTED==0)); then
-    # Default --apply force-upgrades the installed SYSTEM Node package to LTS.
-    # Ubuntu 18.x and NodeSource 20/22.x are both supported. NVM is separate.
-    if ((NODE_LTS==0 && AUTO_LTS==1)) && [[ -x /usr/bin/node ]] &&
-       dpkg-query -W -f='${Status}' nodejs 2>/dev/null | grep -q '^install ok installed$'; then
-      major_now=$(/usr/bin/node -p 'process.versions.node.split(".")[0]' 2>/dev/null || true)
-      if [[ $major_now =~ ^[0-9]+$ ]] && ((major_now <= NODE_LTS_MAJOR)); then
-        NODE_LTS=1
-      else
-        warn "Node sistem versi ${major_now:-unknown} tidak bisa dimigrasikan aman ke ${NODE_LTS_MAJOR}.x."
-        NODE_LTS_SKIPPED=1
-      fi
-    fi
-    # An unsupervised Node process is not reason to skip installing the requested
-    # LTS runtime. It is, however, a reason NOT to claim the application migrated.
-    if ((NODE_LTS==1)); then
-      if ! prepare_nodesource_lts; then
-        err 'Target Node 24 LTS tidak dapat disiapkan. Upgrade dibatalkan, service akan dipulihkan; tidak mengklaim sukses.'
-        NODE_LTS_SKIPPED=1
+    # Install an official Node binary first; APT package conflicts cannot block it.
+    if [[ -x /usr/bin/node ]]; then
+      NODE_LTS=1
+      if ! node_official_install; then
         APPLY_ABORTED=1
       fi
     fi
   fi
-  if ((APPLY_ABORTED==0)); then
+  if ((RUNTIME_ONLY==1 && APPLY_ABORTED==0)); then
+    section 'UPGRADE RUNTIME SAJA'
+    ok 'APT upgrade umum dilewati; Node menggunakan binary official (tanpa migrasi paket APT).'
+  fi
+  if ((RUNTIME_ONLY==0 && APPLY_ABORTED==0)); then
     section 'APT UPDATE DAN UPGRADE'
     if [[ $CONTAINER == yes ]]; then warn 'Container APT mode enabled; no automatic service restarts in container'; fi
     if [[ -r /var/lib/dpkg/status ]]; then
       dpkg-query -W -f='${binary:Package}\t${Version}\n' > "$TMP/packages-before" 2>/dev/null || true
     fi
-    # Resolve the APT candidate AFTER refreshing repository metadata.
-    # Read the full apt-cache output into a temporary file: piping its output
-    # into an early-exiting awk can raise SIGPIPE with `set -o pipefail`.
-    # If the candidate cannot be checked for installed Node, fail safely.
-    node_apt_major_check() {
-      local installed candidate installed_major candidate_major error_message
-      command -v dpkg-query >/dev/null 2>&1 || { err 'dpkg-query tidak tersedia; upgrade dibatalkan'; return 1; }
-      installed=$(dpkg-query -W -f='${Version}' nodejs 2>/dev/null || true)
-      if [[ -z $installed ]]; then
-        log 'Node.js tidak dikelola paket APT: pemeriksaan major Node APT dilewati.'
-        return 0
-      fi
-      command -v apt-cache >/dev/null 2>&1 || { err 'apt-cache tidak tersedia; upgrade dibatalkan'; return 1; }
-      if ! apt-cache policy nodejs > "$TMP/node-apt-policy" 2> "$TMP/node-apt-policy-stderr"; then
-        error_message=$(sed -n '1p' "$TMP/node-apt-policy-stderr")
-        err "Gagal membaca apt-cache policy nodejs: ${error_message:-periksa konfigurasi repository APT}. Upgrade dibatalkan."
-        return 1
-      fi
-      candidate=$(awk '$1=="Candidate:" {print $2}' "$TMP/node-apt-policy")
-      if [[ -z $candidate || $candidate == '(none)' ]]; then
-        warn "Node.js terpasang ($installed), tetapi kandidat APT tidak tersedia. Node tidak akan diperbarui oleh APT."
-        return 0
-      fi
-      # Debian package versions may have an epoch (for example 2:22.2.0).
-      installed_major=$(printf '%s\n' "${installed#*:}" | awk -F '.' '$1~/^[0-9]+$/ {print $1}')
-      candidate_major=$(printf '%s\n' "${candidate#*:}" | awk -F '.' '$1~/^[0-9]+$/ {print $1}')
-      if [[ -z $installed_major || -z $candidate_major ]]; then
-        err "Tidak bisa membandingkan major Node APT: $installed -> $candidate. Upgrade dibatalkan."
-        return 1
-      fi
-      log "Node APT: $installed -> $candidate (major $installed_major -> $candidate_major)"
-      if [[ $installed_major != "$candidate_major" ]]; then
-        if ((NODE_LTS == 1)) && [[ $candidate_major == "$NODE_LTS_MAJOR" ]]; then
-          log "Node LTS: major $installed_major.x → $candidate_major.x diizinkan oleh kebijakan --apply."
-        else
-          err "Node APT kandidat major berbeda ($installed -> $candidate). Upgrade dibatalkan; review repo dahulu."
-          return 1
-        fi
-      fi
-      return 0
-    }
-    if run_quiet 'Apt Update' env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none NEEDRESTART_MODE=l apt-get -qq -o DPkg::Lock::Timeout=60 update; then
-      if node_apt_major_check && { ((NODE_LTS==0)) || node_lts_install; }; then
-        if run_quiet 'Apt Upgrade' env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none NEEDRESTART_MODE=l apt-get -qq -o DPkg::Lock::Timeout=60 -o Dpkg::Options::=--force-confold -y upgrade; then
-          APT_RAN=1
-        else
-          APPLY_ABORTED=1
-        fi
+    if ((NODE_LTS==1)) && command -v apt-mark >/dev/null 2>&1 && ! apt-mark showhold | grep -Fxq nodejs; then
+      if apt-mark hold nodejs >"$TMP/node-hold.log" 2>&1; then NODE_APT_HOLD_ADDED=1
+      else err 'Gagal menahan paket Node APT selama upgrade'; APPLY_ABORTED=1; fi
+    fi
+    if ((APPLY_ABORTED==0)) && run_quiet 'Apt Update' env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none NEEDRESTART_MODE=l apt-get -qq -o DPkg::Lock::Timeout=60 update; then
+      if run_quiet 'Apt Upgrade' env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none NEEDRESTART_MODE=l apt-get -qq -o DPkg::Lock::Timeout=60 -o Dpkg::Options::=--force-confold -y upgrade; then
+        APT_RAN=1
       else
         APPLY_ABORTED=1
       fi
     else
       APPLY_ABORTED=1
+    fi
+    if ((NODE_APT_HOLD_ADDED)); then
+      if apt-mark unhold nodejs >"$TMP/node-unhold.log" 2>&1; then NODE_APT_HOLD_ADDED=0
+      else warn 'nodejs masih apt-mark hold, perlu unhold manual.'; fi
     fi
     dpkg-query -W -f='${binary:Package}\t${Version}\n' > "$TMP/packages-after" 2>/dev/null || true
     awk -F '\t' 'NR==FNR{v[$1]=$2;next} ($1 in v) && v[$1]!=$2 {print $1"|"v[$1]"|"$2}' "$TMP/packages-before" "$TMP/packages-after" > "$TMP/packages-changed"
@@ -1825,9 +1656,15 @@ php_stable_upgrade() {
   return 0
 }
 
-if [[ $MODE == apply && $APT_RAN -eq 1 && $CONTAINER == no && -s $TMP/php-before ]]; then
+if [[ $MODE == apply && ( $APT_RAN -eq 1 || $RUNTIME_ONLY -eq 1 ) && $CONTAINER == no && -s $TMP/php-before && $APPLY_ABORTED -eq 0 ]]; then
   section 'PHP STABLE AUTO UPGRADE'
-  if ! php_stable_upgrade; then
+  if ((RUNTIME_ONLY==1)); then
+    if ! run_quiet 'PHP Repository Update' env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get -qq -o DPkg::Lock::Timeout=60 update; then
+      APPLY_ABORTED=1
+      err 'PHP membutuhkan metadata APT, update gagal. PHP tidak diubah.'
+    fi
+  fi
+  if ((APPLY_ABORTED==0)) && ! php_stable_upgrade; then
     APPLY_ABORTED=1
     err 'Migrasi PHP gagal atau tidak dapat diverifikasi; periksa paket dan aplikasi sebelum menjalankan ulang.'
   fi
