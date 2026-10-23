@@ -1,51 +1,39 @@
 # Ubuntu PHP & Node.js Maintenance
 
-Audit dan upgrade PHP/Node.js yang sudah terpasang, restart service, serta pengecekan web/port dari terminal. Tidak membutuhkan `healthchecks.tsv` atau server penyimpanan laporan.
-
-**Versi: v0.4.6**
+Audit dan upgrade PHP/Node.js yang sudah terpasang, kontrol service, dan verifikasi port/URL web dari terminal. **Versi v0.4.8.** Tidak membutuhkan `healthchecks.tsv` maupun collector laporan.
 
 ## 1. Download
 
 ```bash
-curl -fL --retry 3 -o ubuntu-maintenance-v0.4.6.sh https://raw.githubusercontent.com/vaisaldarmawan/updatephpandnodejs/main/ubuntu-maintenance-v0.4.6.sh
+curl -fL --retry 3 -o ubuntu-maintenance-v0.4.8.sh https://raw.githubusercontent.com/vaisaldarmawan/updatephpandnodejs/main/ubuntu-maintenance-v0.4.8.sh
 ```
 
 ## 2. Audit
 
 ```bash
-sudo bash ubuntu-maintenance-v0.4.6.sh --audit
+sudo bash ubuntu-maintenance-v0.4.8.sh --audit
 ```
 
-Memeriksa username, IP lokal/publik, CPU/RAM/disk, PHP/Node.js, PM2 milik root dan user lain, status service, executable Node lama `(deleted)`, serta port web otomatis dengan **IP lokal server**. Port yang hanya bind ke `127.0.0.1` tidak ditampilkan seolah-olah bisa diakses melalui IP LAN.
+Memeriksa IP, user, CPU/RAM/disk, versi PHP/Node, PM2/systemd/proses Node, serta web/port menggunakan IP lokal server. Laporan aplikasi Node kosong ditulis `N/A`.
 
 ## 3. Apply
 
 ```bash
-sudo bash ubuntu-maintenance-v0.4.6.sh --apply
+sudo bash ubuntu-maintenance-v0.4.8.sh --apply
 ```
 
-Menghentikan service PHP/Node terkelola, memperbarui paket APT dan mencoba upgrade runtime yang tersedia, menjalankan kembali service/PM2, restart Nginx/Apache lokal yang sebelumnya aktif, lalu verifikasi status dan URL.
+Menghentikan service terkelola yang terdeteksi, memperbarui paket APT, mencoba migrasi Node sistem ke **24.x LTS**, dan migrasi **PHP CLI ke 8.5.x** jika PHP sudah terpasang. Jika PHP 8.5 belum tersedia, skrip menambahkan `ppa:ondrej/php` melalui Launchpad, memperbarui indeks APT, menyimulasikan instalasi (menolak penghapusan paket), memasang ekstensi yang setara, serta memilih interpreter PHP baru setelah memeriksa modul. Sesudahnya service yang sebelumnya aktif dijalankan kembali, Nginx/Apache lokal direstart setelah uji konfigurasi, lalu port/URL dan runtime diperiksa.
 
-### Opsional: paksa restart aplikasi Node tanpa PM2/systemd
+**Peringatan penting untuk PHP:** Skrip dapat menambahkan **PPA pihak ketiga** (`ppa:ondrej/php`), sehingga paket PHP berikutnya dapat berasal dari pengelola PPA, bukan repositori Canonical. PHP.net memberi peringatan bahwa build pihak ketiga ini memuat perubahan dari penyedia, termasuk patch telemetry pada modul Apache 2 dan PHP-FPM. Pastikan organisasi Anda menyetujui sumber paket tersebut. Untuk situs PHP-FPM/mod_php yang telah menggunakan socket, pool, atau vhost lama, **skrip memasang PHP 8.5 tetapi tidak mengubah konfigurasi web secara membabi buta**. Situs dapat tetap melayani PHP lama sampai migrasi handler diselesaikan; status akan `REVIEW`, bukan klaim seluruh web sudah PHP 8.5. Ekstensi pihak ketiga seperti ionCube juga perlu diverifikasi terpisah. Siapkan snapshot VM/backup, dan gunakan maintenance window.
 
-Jika Anda **secara sadar menerima downtime dan risiko perubahan startup**, gunakan:
+**Peringatan Node.js:** Migrasi major dapat memerlukan perubahan dependency aplikasi. Skrip mendukung paket Node Ubuntu/NodeSource dan memverifikasi rencana APT, tetapi **tidak otomatis meng-upgrade NVM/custom binary**. Proses tanpa supervisor tidak dapat dijamin restart. Untuk percobaan restart paksa proses tersebut, tambahkan `--force-restart-unmanaged` hanya setelah memeriksa risiko Screen/Tmux, environment, dan logging.
+
+Opsional pengecekan URL tambahan (tanpa file konfigurasi):
 
 ```bash
-sudo bash ubuntu-maintenance-v0.4.6.sh --apply --force-restart-unmanaged
+sudo bash ubuntu-maintenance-v0.4.8.sh --audit --check-url http://10.0.0.126:3000/
 ```
 
-Skrip mencoba mengambil username, direktori kerja, argumen dan environment awal proses Node dari `/proc`, lalu stop proses lama, upgrade paket dan menjalankannya lagi **sebagai user asal** (misalnya `mpm`, bukan root). Sebelum stop, semua metadata startup kandidat wajib terbaca. Jika tidak, upgrade dibatalkan tanpa menghentikan aplikasi. Setelah start, skrip memeriksa PID serta executable runtime baru; URL web diperiksa ulang. Saat APT gagal setelah service dihentikan, skrip mencoba pemulihan start.
-
-**Peringatan:** Force restart bukan hal yang setara dengan PM2/systemd. Proses yang semula berjalan dalam Screen/Tmux akan dijalankan ulang **terpisah dari sesi tersebut**. Standard output dan error proses baru diarahkan ke `/dev/null`, sehingga log interaktif Screen tidak berlanjut. Aplikasi yang bergantung pada terminal, wrapper, variable environment dinamis, atau fitur yang tidak kompatibel dengan Node baru dapat gagal menyala. Kembalinya proses tidak menjamin seluruh fungsinya sehat, dan skrip **tidak menjamin rollback otomatis**. Untuk produksi, kelola aplikasi melalui systemd atau PM2 setelah migrasi.
-
-### Opsional: cek URL web tambahan
-
-```bash
-sudo bash ubuntu-maintenance-v0.4.6.sh --audit --check-url http://10.0.0.126:3000/
-```
-
-Alamat di server lain hanya dicek, **tidak direstart** dari mesin lokal. URL otomatis menggunakan IP lokal server, tetapi tidak akan mengklaim port bind-only-loopback (`127.0.0.1`, `::1`) bisa diakses lewat IP lokal. HTTPS via IP otomatis hanya menguji ketersediaan layanan; pemeriksaan sertifikat/vhost perlu URL domain nyata lewat `--check-url`.
-
-> **Catatan produksi:** `--apply` juga meng-upgrade paket APT selain PHP dan Node. Versi PHP major hanya dimigrasikan bila paket dan ekstensi kompatibel; skrip tidak diam-diam mengubah konfigurasi socket PHP-FPM atau menambahkan PPA. Selalu siapkan snapshot/backup dan maintenance window sebelum menjalankan perubahan pada server penting. Mode `--audit` aman untuk inventaris; tes otomatis bukan jaminan aplikasi sehat secara fungsional.
+`--apply` dapat meng-upgrade paket Ubuntu lain, menyebabkan downtime, dan **tidak memiliki rollback otomatis** untuk seluruh sistem. HTTP 2xx/3xx berarti endpoint merespons, bukan jaminan database/queue atau aplikasi sehat secara keseluruhan.
 
 [Repository GitHub](https://github.com/vaisaldarmawan/updatephpandnodejs)
