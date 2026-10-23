@@ -1,56 +1,51 @@
 # Ubuntu PHP & Node.js Maintenance
 
-Script Bash untuk audit Ubuntu, upgrade PHP/Node.js **yang sudah terpasang**, stop/start layanan terkelola, dan cek URL/port web sebelum-sesudah maintenance. Semua hasil di terminal, **tanpa upload laporan** dan tanpa `healthchecks.tsv`.
+Audit dan upgrade PHP/Node.js yang sudah terpasang, restart service, serta pengecekan web/port dari terminal. Tidak membutuhkan `healthchecks.tsv` atau server penyimpanan laporan.
 
-**Versi: v0.4.5**
+**Versi: v0.4.6**
 
-## Cara menggunakan
-
-### 1. Download
+## 1. Download
 
 ```bash
-curl -fL --retry 3 -o ubuntu-maintenance-v0.4.5.sh https://raw.githubusercontent.com/vaisaldarmawan/updatephpandnodejs/main/ubuntu-maintenance-v0.4.5.sh
+curl -fL --retry 3 -o ubuntu-maintenance-v0.4.6.sh https://raw.githubusercontent.com/vaisaldarmawan/updatephpandnodejs/main/ubuntu-maintenance-v0.4.6.sh
 ```
 
-### 2. Audit
+## 2. Audit
 
 ```bash
-sudo bash ubuntu-maintenance-v0.4.5.sh --audit
+sudo bash ubuntu-maintenance-v0.4.6.sh --audit
 ```
 
-Memeriksa versi runtime, aplikasi Node/PHP, proses yang menggunakan executable lama (`(deleted)`), PM2/systemd, CPU, RAM, disk, IP, serta port TCP web yang dapat dikenali. Audit tidak mengubah paket atau me-restart service.
+Memeriksa username, IP lokal/publik, CPU/RAM/disk, PHP/Node.js, PM2 milik root dan user lain, status service, executable Node lama `(deleted)`, serta port web otomatis dengan **IP lokal server**. Port yang hanya bind ke `127.0.0.1` tidak ditampilkan seolah-olah bisa diakses melalui IP LAN.
 
-### 3. Apply
+## 3. Apply
 
 ```bash
-sudo bash ubuntu-maintenance-v0.4.5.sh --apply
+sudo bash ubuntu-maintenance-v0.4.6.sh --apply
 ```
 
-Root akan mengelola PM2 milik masing-masing pengguna (misalnya `mpm`) dengan identitas pengguna dan `PM2_HOME` miliknya, bukan PM2 root. Instalasi PM2 dengan lokasi data nonstandar mungkin tidak terdeteksi.
+Menghentikan service PHP/Node terkelola, memperbarui paket APT dan mencoba upgrade runtime yang tersedia, menjalankan kembali service/PM2, restart Nginx/Apache lokal yang sebelumnya aktif, lalu verifikasi status dan URL.
 
-Urutannya: **inventaris → cek URL sebelum upgrade → stop PHP-FPM/Node systemd/PM2 terkelola → upgrade paket/runtime → start kembali → restart Nginx/Apache lokal yang semula aktif → cek runtime, service, URL/port → ringkasan**.
+### Opsional: paksa restart aplikasi Node tanpa PM2/systemd
 
-### Opsional: cek URL web tertentu
-
-Jika ingin memastikan alamat web tertentu—misalnya aplikasi yang berada di server lain—tambahkan `--check-url`:
+Jika Anda **secara sadar menerima downtime dan risiko perubahan startup**, gunakan:
 
 ```bash
-sudo bash ubuntu-maintenance-v0.4.5.sh --audit --check-url http://10.0.0.126:3000/
+sudo bash ubuntu-maintenance-v0.4.6.sh --apply --force-restart-unmanaged
 ```
 
-Atau saat upgrade:
+Skrip mencoba mengambil username, direktori kerja, argumen dan environment awal proses Node dari `/proc`, lalu stop proses lama, upgrade paket dan menjalankannya lagi **sebagai user asal** (misalnya `mpm`, bukan root). Sebelum stop, semua metadata startup kandidat wajib terbaca. Jika tidak, upgrade dibatalkan tanpa menghentikan aplikasi. Setelah start, skrip memeriksa PID serta executable runtime baru; URL web diperiksa ulang. Saat APT gagal setelah service dihentikan, skrip mencoba pemulihan start.
+
+**Peringatan:** Force restart bukan hal yang setara dengan PM2/systemd. Proses yang semula berjalan dalam Screen/Tmux akan dijalankan ulang **terpisah dari sesi tersebut**. Standard output dan error proses baru diarahkan ke `/dev/null`, sehingga log interaktif Screen tidak berlanjut. Aplikasi yang bergantung pada terminal, wrapper, variable environment dinamis, atau fitur yang tidak kompatibel dengan Node baru dapat gagal menyala. Kembalinya proses tidak menjamin seluruh fungsinya sehat, dan skrip **tidak menjamin rollback otomatis**. Untuk produksi, kelola aplikasi melalui systemd atau PM2 setelah migrasi.
+
+### Opsional: cek URL web tambahan
 
 ```bash
-sudo bash ubuntu-maintenance-v0.4.5.sh --apply --check-url http://10.0.0.126:3000/
+sudo bash ubuntu-maintenance-v0.4.6.sh --audit --check-url http://10.0.0.126:3000/
 ```
 
-Opsi `--check-url` dapat diulang untuk beberapa URL, termasuk `https://`. Tidak ada file konfigurasi tambahan. Script juga berusaha mendeteksi port Node/PHP/Nginx/Apache yang `LISTEN` menggunakan `ss` (sejauh informasi PID dapat dibaca). **Web server di IP lain tidak direstart dari skrip ini**. **IP server lain tidak otomatis dipindai**; gunakan `--check-url` untuk URL eksternal.
+Alamat di server lain hanya dicek, **tidak direstart** dari mesin lokal. URL otomatis menggunakan IP lokal server, tetapi tidak akan mengklaim port bind-only-loopback (`127.0.0.1`, `::1`) bisa diakses lewat IP lokal. HTTPS via IP otomatis hanya menguji ketersediaan layanan; pemeriksaan sertifikat/vhost perlu URL domain nyata lewat `--check-url`.
 
-**Arti pemeriksaan:** HTTP 2xx/3xx = endpoint merespons; HTTP 401/403 = endpoint dapat diakses tetapi memerlukan autentikasi; HTTP 4xx/5xx atau koneksi gagal = perlu investigasi. Respons HTTP belum membuktikan database, worker, atau seluruh fitur aplikasi normal. URL yang sebelumnya merespons tetapi menjadi gagal setelah upgrade akan menyebabkan hasil `FAIL`. Proses dengan binary `(deleted)` akan ditandai `STALE` meskipun URL masih merespons.
-
-> [!WARNING]
-> Mode `--apply` memperbarui seluruh paket APT, selain upaya upgrade PHP/Node yang didukung. Upgrade mayor dapat menyebabkan downtime dan ketidakcocokan aplikasi. Simpan snapshot/backup dan uji di server nonproduksi terlebih dahulu. Proses mandiri (misalnya Node di GNU Screen/Tmux) **tidak dihentikan secara paksa**, sebab perintah startup aslinya tidak selalu dapat dipulihkan. Aplikasi seperti itu mungkin perlu restart manual atau dipindah ke systemd/PM2. Skrip tidak membuat rollback otomatis dan tidak me-reboot server.
+> **Catatan produksi:** `--apply` juga meng-upgrade paket APT selain PHP dan Node. Versi PHP major hanya dimigrasikan bila paket dan ekstensi kompatibel; skrip tidak diam-diam mengubah konfigurasi socket PHP-FPM atau menambahkan PPA. Selalu siapkan snapshot/backup dan maintenance window sebelum menjalankan perubahan pada server penting. Mode `--audit` aman untuk inventaris; tes otomatis bukan jaminan aplikasi sehat secara fungsional.
 
 [Repository GitHub](https://github.com/vaisaldarmawan/updatephpandnodejs)
-
-**Catatan restart:** Nginx/Apache lokal yang tadinya aktif akan di-restart setelah proses aplikasi terkelola hidup kembali, walaupun paket Nginx/Apache tidak berubah. Konfigurasi diuji sebelum upgrade dan sebelum restart. `--no-restart` menonaktifkan tindakan tersebut. Proses Node yang berjalan di Screen/Tmux tanpa manajer tetap hanya ditandai `STALE`; skrip tidak mengirim `kill` tanpa perintah start yang pasti.
