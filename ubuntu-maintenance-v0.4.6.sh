@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-SCRIPT_VERSION='0.4.6'
+SCRIPT_VERSION='0.4.8'
 MODE='audit'
 ALLOW_CONTAINER=0
 UPDATE_NVM=0
@@ -42,6 +42,11 @@ RUNTIME_TARGET_FAILED=0
 NODE_SOURCE_FILE=''
 NODE_SOURCE_BACKUP=''
 NODE_SOURCE_SWITCHED=0
+NODE_NEW_REPO=0
+NODE_REPO_CREATED_PATHS=()
+NODE_REPO_BACKUP_PATHS=()
+NODE_REPO_BACKUP_FILES=()
+NODE_LTS_APT_ARGS=('nodejs')
 NODE_MAJOR_INSTALLED=0
 START_PHASE_DONE=0
 STOP_PHASE_ENTERED=0
@@ -55,19 +60,19 @@ FORCE_UNMANAGED_COUNT=0
 
 usage() {
 cat <<'HELP'
-Ubuntu Maintenance v0.4.6 — terminal-only (no report upload or saved logs)
+Ubuntu Maintenance v0.4.8 — terminal-only (no report upload or saved logs)
 
-  bash ubuntu-maintenance-v0.4.6.sh --audit             # regular user or root
-  sudo bash ubuntu-maintenance-v0.4.6.sh --audit        # fuller host inventory
-  bash ubuntu-maintenance-v0.4.6.sh --demo              # simulated terminal view
-  sudo bash ubuntu-maintenance-v0.4.6.sh --apply        # stop managed apps, upgrade runtimes, start and verify
+  bash ubuntu-maintenance-v0.4.8.sh --audit             # regular user or root
+  sudo bash ubuntu-maintenance-v0.4.8.sh --audit        # fuller host inventory
+  bash ubuntu-maintenance-v0.4.8.sh --demo              # simulated terminal view
+  sudo bash ubuntu-maintenance-v0.4.8.sh --apply        # stop managed apps, upgrade runtimes, start and verify
 
 Options:
   --audit                 Read-only inventory (default), supports non-root/container
   --apply                 Stop managed PHP/Node apps, upgrade runtimes, start apps, verify
   --allow-container-apply Explicitly permit APT inside container (no auto restarts)
   --update-nvm            Update NVM default within its existing major (optional)
-  --node-lts              Require a recognized NodeSource path to Node 24 LTS (strict mode)
+  --node-lts              Require Node 24 LTS migration, including Ubuntu APT -> NodeSource
   --no-restart            Skip automatic PHP/Node stop/start and local web-server restart
   --force-restart-unmanaged
                          Force stop/start standalone Node processes using original
@@ -81,13 +86,13 @@ Options:
   -h, --help              Show this help
 
 Important:
-* APT updates installed Ubuntu-managed PHP/Node packages, NOT NVM/asdf/fnm,
-  Docker images, or binaries installed manually. PHP 8.5 requires an existing compatible APT repository; the script never silently adds a PPA.
+* APT upgrades Ubuntu-packaged Node via verified NodeSource 24.x if installed; it does NOT upgrade NVM/asdf/fnm,
+  Docker images, or binaries installed manually. This adds a third-party NodeSource APT repository for Ubuntu Node 18/20/22, after checking signing keys and package-removal simulations. PHP 8.5 can configure the third-party ppa:ondrej/php on supported Ubuntu when missing; review provider trust and compatibility first.
 * Root manages PM2 as each owning user with its own HOME/PM2_HOME (not the root PM2 list). PM2 installations with custom PM2_HOME need manual handling.
 * Managed PHP/Node systemd services and online PM2 apps are stopped before changing packages and started afterward, including recovery attempts on failure. Local active Nginx/Apache is restarted after apps start, if its configuration test passes.
 * --force-restart-unmanaged (explicit opt-in) captures startup argv/cwd/env for standalone Node apps, terminates them and starts detached copies as the original user. This CHANGES Screen/Tmux behavior and redirects future stdout/stderr to /dev/null; interactive apps, dynamic startup wrappers and nonpersistent dependencies can fail. If metadata cannot be captured, the script aborts before stopping any app. Prefer systemd/PM2 for production.
 * A process with /proc/PID/exe marked (deleted), or an executable inode different from the current binary, is reported STALE on every run (audit and apply), including when APT changed no packages.
-* PHP 8.5 CLI migration runs only for CLI-only installs with matching modules; existing PHP-FPM virtual hosts are never automatically rewired. Latest PHP major may remain pending on FPM-backed sites.
+* PHP 8.5 CLI + matching installed extensions are upgraded using APT (ppa:ondrej/php if needed). Active PHP-FPM virtual hosts are NOT blindly rewritten: old FPM remains serving until independently migrated; report will flag pending FPM cutover. Third-party PPA may use provider-specific changes/telemetry.
 * Apply needs no configuration file; HTTP GET is checked on identified local TCP ports and optional --check-url values. HTTP response checks do not guarantee database/queue functionality. During the stop→start window, monitored applications may be unavailable.
 * No automatic reboot, rollback, or container orchestration actions.
 * apt-get itself can restart services before our controlled restart phase.
@@ -98,7 +103,7 @@ HELP
 demo() {
 cat <<'DEMO'
 ╔════════════════════════════════════════════════════════════════════╗
-║  UBUNTU MAINTENANCE v0.4.6 • SIMULASI (BUKAN HASIL SERVER ASLI)   ║
+║  UBUNTU MAINTENANCE v0.4.8 • SIMULASI (BUKAN HASIL SERVER ASLI)   ║
 ╚════════════════════════════════════════════════════════════════════╝
 [15:08:21] Mode              : APPLY
 [15:08:21] Hostname          : prod-api-01
@@ -222,8 +227,18 @@ cleanup() {
     printf '\n[RECOVERY] Upaya menghidupkan kembali service/aplikasi yang dihentikan...\n' >&2
     bring_back_managed || true
   fi
-  if (( NODE_SOURCE_SWITCHED == 1 && NODE_MAJOR_INSTALLED == 0 )) && [[ -n $NODE_SOURCE_FILE && -f $NODE_SOURCE_BACKUP ]]; then
-    cp -p -- "$NODE_SOURCE_BACKUP" "$NODE_SOURCE_FILE" || printf 'WARNING: failed restoring NodeSource repository %s\n' "$NODE_SOURCE_FILE" >&2
+  if (( NODE_MAJOR_INSTALLED == 0 )); then
+    if (( NODE_SOURCE_SWITCHED == 1 )) && [[ -n $NODE_SOURCE_FILE && -f $NODE_SOURCE_BACKUP ]]; then
+      cp -p -- "$NODE_SOURCE_BACKUP" "$NODE_SOURCE_FILE" || printf 'WARNING: gagal mengembalikan sumber NodeSource %s\n' "$NODE_SOURCE_FILE" >&2
+    fi
+    if (( NODE_NEW_REPO == 1 )); then
+      for path in "${NODE_REPO_CREATED_PATHS[@]}"; do
+        rm -f -- "$path" || printf 'WARNING: gagal membersihkan %s\n' "$path" >&2
+      done
+      for i in "${!NODE_REPO_BACKUP_PATHS[@]}"; do
+        cp -p -- "${NODE_REPO_BACKUP_FILES[$i]}" "${NODE_REPO_BACKUP_PATHS[$i]}" || printf 'WARNING: gagal memulihkan %s\n' "${NODE_REPO_BACKUP_PATHS[$i]}" >&2
+      done
+    fi
   fi
   if [[ -n $TMP && -d $TMP ]]; then rm -rf -- "$TMP"; fi
   exit "$rc"
@@ -512,6 +527,13 @@ node_proc_inventory() {
     exe=$(node_exe "$pid")
     unit=$(service_for_pid "$pid")
     cwd=$(node_cwd "$pid")
+    # A Node process living under cron.service is normally a cron JOB, not
+    # a Node application supervised by systemd. Restarting cron won't restart
+    # an already-running job (and can disrupt unrelated scheduled tasks).
+    case "$unit" in
+      cron.service|crond.service|atd.service|ssh.service|sshd.service|systemd-*.service|user@*.service|dbus.service|containerd.service|docker.service)
+        unit='' ;;
+    esac
     if [[ -n $unit ]]; then
       desc=$unit; state="$(systemctl is-active "$unit" 2>/dev/null || echo unknown)"
       printf 'systemd|%s|%s|%s|%s|%s\n' "$user" "$desc" "$state" "$pid" "$exe" >> "$target"
@@ -1140,6 +1162,7 @@ managed_stop_plan() {
     [[ $php_pid =~ ^[0-9]+$ && $php_comm =~ ^php([0-9.]+)?$ ]] || continue
     unit=$(service_for_pid "$php_pid")
     [[ $unit == *.service && $unit != user@*.service && $unit != pm2-*.service ]] || continue
+    case "$unit" in cron.service|crond.service|atd.service|ssh.service|sshd.service|docker.service|containerd.service|dbus.service|systemd-*.service) continue ;; esac
     status=$(systemctl is-active "$unit" 2>/dev/null || true)
     [[ $status == active ]] && printf '%s\n' "$unit" >> "$TMP/stop-plan-services"
   done < <(ps -eo pid=,comm= -ww 2>/dev/null || true)
@@ -1267,6 +1290,81 @@ bring_back_managed() {
   return 0
 }
 
+# Add NodeSource 24.x for a system-packaged Node installation when Ubuntu's own
+# repo only offers 18.x. Never execute a downloaded shell script as root.
+# Repo and key are reverted on failure before the Node package is changed.
+node_repo_track_write() {
+  local dest=$1 backup
+  if [[ -e $dest ]]; then
+    backup="$TMP/node-repo-backup-${#NODE_REPO_BACKUP_PATHS[@]}"
+    cp -p -- "$dest" "$backup" || return 1
+    NODE_REPO_BACKUP_PATHS+=("$dest")
+    NODE_REPO_BACKUP_FILES+=("$backup")
+  else
+    NODE_REPO_CREATED_PATHS+=("$dest")
+  fi
+}
+
+install_ubuntu_nodesource_repo() {
+  local arch path keyurl cmd key_fingerprint
+  arch=$(dpkg --print-architecture 2>/dev/null || true)
+  if [[ $arch != amd64 && $arch != arm64 ]]; then
+    err "NodeSource 24.x: arsitektur $arch tidak didukung oleh setup resmi (amd64/arm64)."
+    return 1
+  fi
+  for cmd in curl gpg install apt-cache apt-get dpkg; do
+    command -v "$cmd" >/dev/null 2>&1 || { err "NodeSource memerlukan utilitas: $cmd"; return 1; }
+  done
+  # Do not overwrite a source or key managed by a different installation.
+  for path in /etc/apt/sources.list.d/nodesource.list /etc/apt/sources.list.d/nodesource.sources; do
+    if [[ -e $path ]]; then
+      err "File $path sudah ada dengan format repo tidak dikenali; tidak akan ditimpa."
+      return 1
+    fi
+  done
+  keyurl='https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key'
+  if ! run_quiet 'NodeSource Key Download' curl -fsSL --proto '=https' --tlsv1.2 --connect-timeout 8 --max-time 40 -o "$TMP/nodesource-key.asc" "$keyurl"; then
+    return 1
+  fi
+  if ! gpg --batch --yes --dearmor -o "$TMP/nodesource-key.gpg" "$TMP/nodesource-key.asc" >"$TMP/nodesource-gpg.log" 2>&1 || [[ ! -s $TMP/nodesource-key.gpg ]]; then
+    err 'Gagal mengimpor kunci GPG NodeSource (bukan keyring valid).'
+    return 1
+  fi
+  # Match official NodeSource public key (do not trust an arbitrary key).
+  # A future key rotation must be reviewed and explicitly updated.
+  if ! gpg --batch --show-keys --with-colons "$TMP/nodesource-key.gpg" >"$TMP/nodesource-key-info" 2>/dev/null; then
+    err 'NodeSource signing key tidak bisa diverifikasi.'
+    return 1
+  fi
+  key_fingerprint=$(awk -F: '$1=="fpr" {print $10;exit}' "$TMP/nodesource-key-info")
+  if [[ $key_fingerprint != 6F71F525282841EEDAF851B42F59B5F99B1BE0B4 ]]; then
+    err "Fingerprint GPG NodeSource tidak dikenal ($key_fingerprint). Repository tidak ditambahkan."
+    return 1
+  fi
+  mkdir -p /usr/share/keyrings /etc/apt/preferences.d /etc/apt/sources.list.d
+  NODE_NEW_REPO=1
+  for path in /usr/share/keyrings/nodesource.gpg /etc/apt/sources.list.d/nodesource.sources /etc/apt/preferences.d/nodejs; do
+    node_repo_track_write "$path" || { err "Gagal backup $path"; return 1; }
+  done
+  install -m 0644 "$TMP/nodesource-key.gpg" /usr/share/keyrings/nodesource.gpg || return 1
+  cat > /etc/apt/sources.list.d/nodesource.sources <<EOF
+Types: deb
+URIs: https://deb.nodesource.com/node_${NODE_LTS_MAJOR}.x
+Suites: nodistro
+Components: main
+Architectures: $arch
+Signed-By: /usr/share/keyrings/nodesource.gpg
+EOF
+  cat > /etc/apt/preferences.d/nodejs <<'EOF'
+Package: nodejs
+Pin: origin deb.nodesource.com
+Pin-Priority: 600
+EOF
+  chmod 0644 /etc/apt/sources.list.d/nodesource.sources /etc/apt/preferences.d/nodejs
+  log "NodeSource: Node Ubuntu → Node ${NODE_LTS_MAJOR}.x LTS (repo HTTPS + signed-by keyring)."
+  return 0
+}
+
 # NodeSource major migration is part of --apply when its repository is recognized.
 # Only modify the single recognized NodeSource APT source (its signing key stays unchanged).
 prepare_nodesource_lts() {
@@ -1302,8 +1400,13 @@ prepare_nodesource_lts() {
       source_count=$((source_count+1))
     fi
   done
-  if ((source_count != 1)); then
-    err "Ditemukan $source_count file repository NodeSource; diharapkan tepat satu. Tidak diubah otomatis."
+  if ((source_count == 0)); then
+    # Ubuntu default package (e.g. 18.19.1+dfsg-6ubuntu5).
+    # Force the requested upgrade by configuring a signed NodeSource LTS repo.
+    install_ubuntu_nodesource_repo
+    return $?
+  elif ((source_count != 1)); then
+    err "Ditemukan $source_count file repository NodeSource; diharapkan maksimal satu."
     return 1
   fi
   if [[ ! -w $NODE_SOURCE_FILE ]]; then err "Source APT tidak dapat ditulis: $NODE_SOURCE_FILE"; return 1; fi
@@ -1320,24 +1423,64 @@ prepare_nodesource_lts() {
 }
 
 node_lts_install() {
-  local candidate major rc
+  local candidate major rc installed_pkg
   candidate=$(awk '$1=="Candidate:" {print $2}' "$TMP/node-apt-policy")
   major=$(printf '%s\n' "${candidate#*:}" | awk -F'.' '$1~/^[0-9]+$/ {print $1}')
   if [[ $major != "$NODE_LTS_MAJOR" ]]; then
     err "NodeSource tidak menyediakan kandidat $NODE_LTS_MAJOR.x ($candidate). Repository akan dipulihkan."
     return 1
   fi
-  if ! env DEBIAN_FRONTEND=noninteractive apt-get -s install nodejs > "$TMP/node-install-plan" 2>&1; then
-    err 'Simulasi instalasi Node LTS gagal. Repository akan dipulihkan.'
-    return 1
+  installed_pkg=$(dpkg-query -W -f='${Version}' nodejs 2>/dev/null || true)
+  if [[ -n $installed_pkg ]] && dpkg --compare-versions "$installed_pkg" ge "$candidate"; then
+    log "Node LTS ${NODE_LTS_MAJOR}.x: paket sudah versi terkini ($installed_pkg)."
+    return 0
+  fi
+  NODE_LTS_APT_ARGS=('nodejs')
+  if (( NODE_NEW_REPO == 1 )); then
+    # NodeSource nodejs bundles npm; Ubuntu's separate npm/docs/devel packages
+    # can collide at dpkg file level even if apt-get -s alone appears fine.
+    for pkg in npm nodejs-doc libnode-dev; do
+      if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q '^install ok installed$'; then
+        NODE_LTS_APT_ARGS+=("${pkg}-")
+      fi
+    done
+  fi
+  if ! env DEBIAN_FRONTEND=noninteractive apt-get -s install "${NODE_LTS_APT_ARGS[@]}" > "$TMP/node-install-plan" 2>&1 || grep -q '^Remv ' "$TMP/node-install-plan"; then
+    # NodeSource bundles npm; Ubuntu may have a separate package named npm.
+    # Explicitly request removal of only this narrow set, and reject anything
+    # else the resolver wants to remove (especially application dependencies).
+    NODE_LTS_APT_ARGS=('nodejs')
+    for pkg in npm nodejs-doc libnode-dev; do
+      if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q '^install ok installed$'; then
+        NODE_LTS_APT_ARGS+=("${pkg}-")
+      fi
+    done
+    if ! env DEBIAN_FRONTEND=noninteractive apt-get -s install "${NODE_LTS_APT_ARGS[@]}" > "$TMP/node-install-plan" 2>&1; then
+      err 'Simulasi instalasi Node 24 LTS gagal. Periksa konflik paket npm/libnode; service akan dihidupkan lagi.'
+      return 1
+    fi
+    if grep '^Remv ' "$TMP/node-install-plan" | awk '$2!="npm" && $2!="nodejs-doc" && $2!="libnode-dev" {bad=1;print} END{exit !bad}' > "$TMP/node-unexpected-removals"; then
+      err "APT ingin menghapus paket di luar npm/nodejs-doc/libnode-dev: $(head -n 1 "$TMP/node-unexpected-removals"). Dibatalkan."
+      return 1
+    fi
+    if (( ${#NODE_LTS_APT_ARGS[@]} > 1 )); then
+      warn 'NodeSource menggantikan paket npm/nodejs-doc/libnode-dev distribusi (sesuai hasil simulasi); npm NodeSource akan diperiksa sesudah upgrade.'
+    fi
   fi
   if grep -q '^Remv ' "$TMP/node-install-plan"; then
-    err 'Simulasi migrasi Node menunjukkan penghapusan paket lain; upgrade dibatalkan.'
+    if grep '^Remv ' "$TMP/node-install-plan" | awk '$2!="npm" && $2!="nodejs-doc" && $2!="libnode-dev" {bad=1;print} END{exit !bad}' > "$TMP/node-unexpected-removals"; then
+      err "APT ingin menghapus paket yang tidak disetujui: $(head -n 1 "$TMP/node-unexpected-removals"). Dibatalkan."
+      return 1
+    fi
+  fi
+  # Verify the simulation installs a NodeSource 24.x package, not Ubuntu's 18.x.
+  if ! grep -Eq '^Inst nodejs .*24\.' "$TMP/node-install-plan" && ! grep -Eq '^Inst nodejs .*\(24\.' "$TMP/node-install-plan"; then
+    err 'Rencana APT tidak menunjukkan pemasangan Node 24.x; upgrade dibatalkan.'
     return 1
   fi
   # From this point dpkg may change the installed major; never restore the old repo blindly.
   NODE_MAJOR_INSTALLED=1
-  if ! run_quiet 'Node LTS Upgrade' env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none NEEDRESTART_MODE=l apt-get -qq -o DPkg::Lock::Timeout=60 -o Dpkg::Options::=--force-confold -y --only-upgrade install nodejs; then
+  if ! run_quiet 'Node LTS Upgrade' env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none NEEDRESTART_MODE=l apt-get -qq -o DPkg::Lock::Timeout=60 -o Dpkg::Options::=--force-confold -y install "${NODE_LTS_APT_ARGS[@]}"; then
     return 1
   fi
   major=$(/usr/bin/node -p 'process.versions.node.split(".")[0]' 2>/dev/null || true)
@@ -1371,30 +1514,25 @@ if [[ $MODE == apply ]]; then
     fi
   fi
   if ((APPLY_ABORTED==0)); then
-    # Default --apply upgrades NodeSource-managed Node to production LTS.
-    # Unmanaged applications are not terminated and remain pending restart.
+    # Default --apply force-upgrades the installed SYSTEM Node package to LTS.
+    # Ubuntu 18.x and NodeSource 20/22.x are both supported. NVM is separate.
     if ((NODE_LTS==0 && AUTO_LTS==1)) && [[ -x /usr/bin/node ]] &&
        dpkg-query -W -f='${Status}' nodejs 2>/dev/null | grep -q '^install ok installed$'; then
-      if [[ -n $(grep -El 'deb\.nodesource\.com/node_[0-9]+\.x' /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true) ]]; then
+      major_now=$(/usr/bin/node -p 'process.versions.node.split(".")[0]' 2>/dev/null || true)
+      if [[ $major_now =~ ^[0-9]+$ ]] && ((major_now <= NODE_LTS_MAJOR)); then
         NODE_LTS=1
       else
-        major_now=$(/usr/bin/node -p 'process.versions.node.split(".")[0]' 2>/dev/null || true)
-        if [[ $major_now != "$NODE_LTS_MAJOR" ]]; then
-          warn "Node $major_now.x tidak menggunakan repository NodeSource yang dikenali; migrasi LTS otomatis dilewati."
-          NODE_LTS_SKIPPED=1
-        fi
+        warn "Node sistem versi ${major_now:-unknown} tidak bisa dimigrasikan aman ke ${NODE_LTS_MAJOR}.x."
+        NODE_LTS_SKIPPED=1
       fi
     fi
     # An unsupervised Node process is not reason to skip installing the requested
     # LTS runtime. It is, however, a reason NOT to claim the application migrated.
     if ((NODE_LTS==1)); then
       if ! prepare_nodesource_lts; then
-        if ((AUTO_LTS==1)); then
-          warn 'Migrasi NodeSource tidak tersedia. Upgrade APT reguler dilanjutkan.'
-          NODE_LTS=0; NODE_LTS_SKIPPED=1
-        else
-          APPLY_ABORTED=1
-        fi
+        err 'Target Node 24 LTS tidak dapat disiapkan. Upgrade dibatalkan, service akan dipulihkan; tidak mengklaim sukses.'
+        NODE_LTS_SKIPPED=1
+        APPLY_ABORTED=1
       fi
     fi
   fi
@@ -1473,116 +1611,166 @@ else
   ok 'Tidak menjalankan apt, mengubah versi runtime, atau restart aplikasi'
 fi
 
-# PHP latest stable: upgrade an existing CLI-only APT installation only when
-# PHP 8.5 is already available from configured/trusted repositories. We never
-# rewrite Nginx upstreams, Apache modules, or PHP-FPM pool/socket paths.
-php_stable_cli_upgrade() {
-  local oldver oldseries candidate oldmodules newmodules newbin oldbin oldreal pkg version wanted pkgname
-  oldbin=$(command -v php 2>/dev/null || true)
-  [[ -n $oldbin && -x $oldbin && -x /usr/bin/php ]] || return 0
+# PHP stable upgrade for installed Ubuntu APT PHP runtimes. Add a signed
+# Launchpad PPA only when the native repository lacks the stable major.
+# Never change an unverified web FPM socket or Apache handler implicitly.
+PHP_FPM_PENDING=0
+PHP_PPA_ADDED=0
+php_candidate() {
+  local name=$1 candidate
+  candidate=$(apt-cache policy "$name" 2>/dev/null | awk '$1=="Candidate:" {print $2}' || true)
+  [[ -n $candidate && $candidate != '(none)' ]]
+}
+
+php_enable_stable_repo() {
+  local candidate distro flag
+  if php_candidate "php${PHP_STABLE_SERIES}-cli"; then return 0; fi
+  # PPA is only added on supported Ubuntu base releases. No source builds,
+  # --allow-unauthenticated, or curl|bash are ever attempted.
+  if [[ ${ID:-} != ubuntu || ${VERSION_ID:-} != 24.04 && ${VERSION_ID:-} != 22.04 ]]; then
+    err "PHP ${PHP_STABLE_SERIES}: repositori APT tidak menyediakan versi target; versi Ubuntu ini belum diizinkan untuk auto-PPA."
+    return 1
+  fi
+  if ! command -v add-apt-repository >/dev/null 2>&1; then
+    if ! apt-get -s install software-properties-common > "$TMP/php-repo-preplan" 2>&1 ||
+       grep -q '^Remv ' "$TMP/php-repo-preplan"; then
+      err 'Persiapan software-properties-common gagal / berisiko menghapus paket.'
+      return 1
+    fi
+    if ! run_quiet 'PHP Repository Tools' env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get -qq -y install software-properties-common; then return 1; fi
+  fi
+  command -v add-apt-repository >/dev/null 2>&1 || { err 'add-apt-repository belum tersedia.'; return 1; }
+  # add-apt-repository handles Launchpad key registration. APT enforces GPG;
+  # third-party package trust still needs operator approval at fleet level.
+  log 'PHP: PHP 8.5 belum tersedia; menambahkan PPA pihak ketiga ppa:ondrej/php (signed via Launchpad).'
+  if ! run_quiet 'PHP Repository Setup' env LC_ALL=C.UTF-8 DEBIAN_FRONTEND=noninteractive add-apt-repository --yes --no-update ppa:ondrej/php; then
+    err 'PPA PHP gagal ditambahkan; PHP tidak dipaksa melalui binary yang tidak diverifikasi.'
+    return 1
+  fi
+  PHP_PPA_ADDED=1
+  if ! run_quiet 'PHP Repository Update' env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get -qq -o DPkg::Lock::Timeout=60 update; then
+    err 'APT update setelah penambahan PHP PPA gagal.'
+    return 1
+  fi
+  if ! php_candidate "php${PHP_STABLE_SERIES}-cli"; then
+    err "Paket PHP ${PHP_STABLE_SERIES} belum tersedia meskipun PPA sudah ditambahkan."
+    return 1
+  fi
+}
+
+php_stable_upgrade() {
+  local oldver oldseries candidate oldmodules newmodules newbin oldreal wanted pkgname
+  local has_fpm=0 has_modphp=0 phpbin missing_modules
+  local -a installs=()
+  phpbin=$(command -v php 2>/dev/null || true)
+  [[ -n $phpbin && -x $phpbin && -x /usr/bin/php ]] || return 0
   oldreal=$(readlink -f /usr/bin/php 2>/dev/null || true)
   oldver=$(/usr/bin/php -r 'echo PHP_VERSION;' 2>/dev/null || true)
-  [[ $oldver =~ ^[0-9]+\.[0-9]+\. ]] || { warn 'PHP tidak berasal dari CLI APT yang dikenali; major upgrade dilewati.'; return 0; }
+  [[ $oldver =~ ^[0-9]+\.[0-9]+\. ]] || { err 'PHP tidak berasal dari binary sistem yang dikenali'; return 1; }
   oldseries=${oldver%.*}
   if [[ $oldseries == "$PHP_STABLE_SERIES" ]]; then
-    log "PHP sudah di cabang $PHP_STABLE_SERIES; patch APT telah dijalankan."
+    log "PHP ${PHP_STABLE_SERIES} terpasang; pembaruan patch dilakukan oleh APT."
     return 0
   fi
   if [[ $(printf '%s\n%s\n' "$PHP_STABLE_SERIES" "$oldseries" | sort -V | tail -n 1) == "$oldseries" ]]; then
-    warn "PHP $oldver lebih baru daripada target stabil $PHP_STABLE_SERIES; tidak diturunkan otomatis."
-    return 0
-  fi
-  # Do not rewire sites, queues, and extension-dependent FPM pools automatically.
-  if grep -Eq '^php[0-9.]+-fpm\.service\|active$|^apache2\.service\|active$' "$TMP/services-before" ||
-      grep -Eq '^libapache2-mod-php' "$TMP/packages-before"; then
-    warn "PHP $oldver: upgrade major ke $PHP_STABLE_SERIES dilewati (PHP-FPM/Apache aktif atau mod_php). Perlu migrasi situs/socket dan ekstensi."
-    return 0
-  fi
-  if grep -Eq '^php[^|]*\|' "$TMP/services-before" ||
-     ps -eo comm= 2>/dev/null | grep -Eq '^php([0-9.]+)?$'; then
-    warn "PHP $oldver: ada worker/proses PHP berjalan; migrasi major CLI perlu review."
+    warn "PHP $oldver di atas target ${PHP_STABLE_SERIES}; downgrade otomatis dilewati."
     return 0
   fi
   if ! dpkg-query -W -f='${Status}' "php${oldseries}-cli" 2>/dev/null | grep -q '^install ok installed$'; then
-    warn 'PHP CLI bukan paket versi APT yang dikenali; tidak memaksakan upgrade.'
-    return 0
+    err "PHP ${oldseries} CLI bukan instalasi APT yang dikenal; tidak menimpa binary manual."
+    return 1
   fi
-  if ! apt-cache policy "php${PHP_STABLE_SERIES}-cli" >"$TMP/php-target-policy" 2>/dev/null; then
-    warn "APT tidak menyediakan PHP $PHP_STABLE_SERIES; tidak menambahkan repository pihak ketiga."
-    return 0
-  fi
-  candidate=$(awk '$1=="Candidate:"{print $2}' "$TMP/php-target-policy")
-  if [[ -z $candidate || $candidate == '(none)' ]]; then
-    warn "PHP $PHP_STABLE_SERIES tidak ada di repository APT saat ini; upgrade major dilewati."
-    return 0
-  fi
-  # Map versioned modules to the equivalent candidate version. Missing
-  # extension packages cause a conservative skip, not partial migration.
-  local -a installs=("php${PHP_STABLE_SERIES}-cli")
+  if ! php_enable_stable_repo; then return 1; fi
+  installs=("php${PHP_STABLE_SERIES}-cli")
+  # Match every versioned PHP extension whose target equivalent exists.
+  # FPM and Apache packages can be installed side-by-side; moving the actual
+  # site handler requires verified configuration, not merely a service start.
   while IFS= read -r pkgname; do
     [[ -n $pkgname ]] || continue
     wanted="php${PHP_STABLE_SERIES}-${pkgname#php${oldseries}-}"
-    if [[ $wanted == "php${PHP_STABLE_SERIES}-cli" || $wanted == "php${PHP_STABLE_SERIES}-common" ]]; then continue; fi
-    if [[ $wanted == *-fpm || $wanted == *-dev || $wanted == *-dbg || $wanted == *-phpdbg ]]; then
-      warn "PHP extension/component $pkgname membutuhkan review; major CLI tidak dipindahkan."
-      return 0
+    case "$wanted" in
+      "php${PHP_STABLE_SERIES}-cli"|"php${PHP_STABLE_SERIES}-common") continue ;;
+      *-dev|*-dbg|*-phpdbg) warn "Paket pengembangan $pkgname tidak otomatis dimigrasikan."; continue ;;
+    esac
+    if ! php_candidate "$wanted"; then
+      err "Modul PHP $pkgname tidak punya pengganti $wanted; migrasi dibatalkan sebelum instalasi."
+      return 1
     fi
-    candidate=$(apt-cache policy "$wanted" 2>/dev/null | awk '$1=="Candidate:" {print $2}')
-    if [[ -z $candidate || $candidate == '(none)' ]]; then
-      warn "PHP extension $pkgname tidak punya paket pengganti $wanted; upgrade major dilewati."
-      return 0
-    fi
+    if [[ $wanted == "php${PHP_STABLE_SERIES}-fpm" ]]; then has_fpm=1; fi
     installs+=("$wanted")
-  done < <(dpkg-query -W -f='${binary:Package}\n' "php${oldseries}-*" 2>/dev/null | grep -E "^php${oldseries//./\.}-" || true)
-  if ! apt-get -s install "${installs[@]}" >"$TMP/php-upgrade-plan" 2>&1 || grep -q '^Remv ' "$TMP/php-upgrade-plan"; then
-    warn "Rencana PHP $PHP_STABLE_SERIES memerlukan penghapusan paket atau gagal disimulasikan; dilewati."
-    return 0
+  done < <(dpkg-query -W -f='${binary:Package}\t${Status}\n' "php${oldseries}-*" 2>/dev/null | awk -F'\t' '$2=="install ok installed" {print $1}' | grep -E "^php${oldseries//./\\.}-" || true)
+  # Detect FPM/Apache regardless of whether the service is active during the
+  # upgrade, as the stop phase has intentionally shut it down.
+  if dpkg-query -W -f='${Status}' "php${oldseries}-fpm" 2>/dev/null | grep -q '^install ok installed$'; then has_fpm=1; fi
+  if dpkg-query -W -f='${Status}' "libapache2-mod-php${oldseries}" 2>/dev/null | grep -q '^install ok installed$'; then has_modphp=1; fi
+  if ((has_modphp)); then
+    # Do NOT install another mod_php automatically: its postinst may enable
+    # the new Apache handler immediately, before site compatibility tests.
+    warn 'Apache mod_php terpasang: PHP CLI/ekstensi dapat di-upgrade, handler Apache tetap perlu migrasi terencana.'
+    PHP_FPM_PENDING=1
+  fi
+  if ((has_fpm)); then installs+=("php${PHP_STABLE_SERIES}-fpm"); fi
+  # Preserve installed package set: reject APT solutions that remove anything.
+  if ! env DEBIAN_FRONTEND=noninteractive apt-get -s install "${installs[@]}" >"$TMP/php-upgrade-plan" 2>&1; then
+    err 'Simulasi pemasangan PHP terbaru gagal (dependency conflict).'
+    return 1
+  fi
+  if grep -q '^Remv ' "$TMP/php-upgrade-plan"; then
+    err "Simulasi PHP ingin menghapus paket: $(grep '^Remv ' "$TMP/php-upgrade-plan" | head -n 1). Dibatalkan."
+    return 1
   fi
   oldmodules=$(/usr/bin/php -m 2>/dev/null | sed -n '/^\[PHP Modules\]/,/^\[Zend Modules\]/{/^\[/d;/^$/d;p;}' | sort -u)
-  if ! run_quiet "PHP ${PHP_STABLE_SERIES} Install" env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none NEEDRESTART_MODE=l apt-get -qq -y install "${installs[@]}"; then
+  if ! run_quiet "PHP ${PHP_STABLE_SERIES} Install" env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none NEEDRESTART_MODE=l apt-get -qq -o DPkg::Lock::Timeout=60 -o Dpkg::Options::=--force-confold -y install "${installs[@]}"; then
+    err 'PHP terbaru gagal dipasang; service lama akan dicoba hidupkan kembali.'
     return 1
   fi
   newbin="/usr/bin/php${PHP_STABLE_SERIES}"
-  if [[ ! -x $newbin ]]; then err "Binary $newbin tidak ditemukan"; return 1; fi
-  # Installing a PHP release may automatically switch the default interpreter
-  # in update-alternatives auto mode. Restore it until module validation passes.
-  if [[ -n $oldreal && $oldreal != "$(readlink -f /usr/bin/php)" ]]; then
-    if update-alternatives --list php 2>/dev/null | grep -Fxq "$oldreal"; then
-      if ! run_quiet 'PHP Default Preserve' update-alternatives --set php "$oldreal"; then
-        err "Gagal mempertahankan PHP default lama ($oldreal)."; return 1
-      fi
+  [[ -x $newbin ]] || { err "$newbin tidak tersedia setelah instalasi."; return 1; }
+  if ! "$newbin" -v > "$TMP/php-new-version" 2>&1; then
+    err "PHP ${PHP_STABLE_SERIES} gagal dieksekusi setelah install."
+    return 1
+  fi
+  newmodules=$("$newbin" -m 2>/dev/null | sed -n '/^\[PHP Modules\]/,/^\[Zend Modules\]/{/^\[/d;/^$/d;p;}' | sort -u)
+  missing_modules=$(comm -23 <(printf '%s\n' "$oldmodules") <(printf '%s\n' "$newmodules") || true)
+  if [[ -n $missing_modules ]]; then
+    # APT install may auto-switch php alternatives: revert before failure.
+    if [[ -n $oldreal ]] && update-alternatives --list php 2>/dev/null | grep -Fxq "$oldreal"; then
+      update-alternatives --set php "$oldreal" > /dev/null 2>&1 || true
+    fi
+    err "PHP $PHP_STABLE_SERIES belum memiliki semua modul lama: $(printf '%s' "$missing_modules" | tr '\n' ','). Default CLI dikembalikan."
+    return 1
+  fi
+  if ! update-alternatives --list php 2>/dev/null | grep -Fxq "$newbin"; then
+    err "PHP baru tidak terdaftar dalam update-alternatives: $newbin"
+    return 1
+  fi
+  if ! run_quiet 'PHP CLI Switch' update-alternatives --set php "$newbin"; then return 1; fi
+  PHP_MIGRATED=1
+  ok "PHP CLI $oldver → $(/usr/bin/php -r 'echo PHP_VERSION;' 2>/dev/null || echo '?')"
+  if ((has_fpm)); then
+    # Install/start the new FPM daemon but do not blindly edit nginx/apache
+    # vhosts, pool sockets, or custom pool configurations.
+    if command -v php-fpm${PHP_STABLE_SERIES} >/dev/null 2>&1 &&
+       php-fpm${PHP_STABLE_SERIES} -t > "$TMP/php-new-fpm-test" 2>&1 &&
+       run_quiet "Start php${PHP_STABLE_SERIES}-fpm" systemctl start "php${PHP_STABLE_SERIES}-fpm.service" &&
+       systemctl is-active --quiet "php${PHP_STABLE_SERIES}-fpm.service"; then
+      ok "PHP-FPM $PHP_STABLE_SERIES aktif."
+      warn "FPM lama php${oldseries}-fpm tetap dapat melayani situs; socket/pool/vhost belum dialihkan secara otomatis."
+      PHP_FPM_PENDING=1
     else
-      err "Default PHP berubah setelah instalasi dan interpreter lama tidak ada di alternatives; perlu review manual."
+      err "FPM ${PHP_STABLE_SERIES} gagal konfigurasi/start. FPM lama akan dihidupkan kembali."
       return 1
     fi
   fi
-  newmodules=$($newbin -m 2>/dev/null | sed -n '/^\[PHP Modules\]/,/^\[Zend Modules\]/{/^\[/d;/^$/d;p;}' | sort -u)
-  if [[ -n $(comm -23 <(printf '%s\n' "$oldmodules") <(printf '%s\n' "$newmodules")) ]]; then
-    warn 'PHP baru belum memuat semua modul CLI lama; default CLI dipertahankan.'
-    return 0
-  fi
-  if [[ $(readlink -f /usr/bin/php) == "$newbin" ]]; then
-    PHP_MIGRATED=1
-    ok "PHP CLI $oldver → $($newbin -r 'echo PHP_VERSION;')"
-    return 0
-  fi
-  if [[ -L /usr/bin/php && $(readlink /usr/bin/php) == /etc/alternatives/php ]] &&
-     update-alternatives --query php >"$TMP/php-alternatives" 2>/dev/null &&
-     update-alternatives --list php 2>/dev/null | grep -Fxq "$newbin"; then
-    if run_quiet 'PHP CLI Switch' update-alternatives --set php "$newbin"; then
-      PHP_MIGRATED=1
-      ok "PHP CLI $oldver → $(php -r 'echo PHP_VERSION;' 2>/dev/null || echo '?')"
-    fi
-  else
-    warn 'PHP 8.5 terpasang tetapi default CLI tidak memakai update-alternatives; tidak mengubah symlink secara paksa.'
-  fi
+
+  return 0
 }
 
 if [[ $MODE == apply && $APT_RAN -eq 1 && $CONTAINER == no && -s $TMP/php-before ]]; then
   section 'PHP STABLE AUTO UPGRADE'
-  if ! php_stable_cli_upgrade; then
+  if ! php_stable_upgrade; then
     APPLY_ABORTED=1
-    err 'Upgrade PHP CLI gagal; periksa status paket sebelum melanjutkan.'
+    err 'Migrasi PHP gagal atau tidak dapat diverifikasi; periksa paket dan aplikasi sebelum menjalankan ulang.'
   fi
 fi
 
@@ -1819,12 +2007,13 @@ if [[ -s $TMP/node-apps-after ]]; then
     NODE_APPS_COUNT=$((NODE_APPS_COUNT+1))
   done < "$TMP/node-apps-after"
 fi
-((NODE_APPS_COUNT>0)) || printf '  (tidak ditemukan / akses terbatas / ada di Docker/Kubernetes)\n'
+((NODE_APPS_COUNT>0)) || printf '  N/A\n'
 printf 'Node app terdeteksi: %s (best-effort, bukan inventaris lengkap)\n' "$NODE_APPS_COUNT"
 printf 'Status aplikasi    : %s aktif / %s gagal / %s unverified (proses saja)\n' "$APP_OK" "$APP_FAIL" "$APP_UNVERIFIED"
 printf 'Restart terkait   : %s OK / %s FAIL\n' "$RESTART_OK" "$RESTART_FAIL"
 printf 'Web URL diperiksa : %s respons / %s belum sehat/terverifikasi\n' "$WEB_PROBE_PASS" "$WEB_PROBE_FAIL"
 if [[ -f /run/reboot-required ]]; then warn 'Server memerlukan reboot (tidak dilakukan otomatis)'; fi
+if ((PHP_FPM_PENDING>0)); then warn 'PHP CLI terbaru sudah terpasang, tetapi situs yang memakai FPM/mod_php perlu verifikasi/migrasi handler.'; fi
 if ((ERRORS>0 || APPLY_ABORTED==1 || RUNTIME_TARGET_FAILED==1)); then RESULT='FAIL'
 elif ((WARN>0 || APP_UNVERIFIED>0)); then RESULT='REVIEW'
 else RESULT='PASS'; fi
