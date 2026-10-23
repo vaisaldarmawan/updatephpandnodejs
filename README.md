@@ -1,40 +1,39 @@
 # Ubuntu PHP & Node.js Maintenance
 
-Satu skrip Bash untuk audit Ubuntu, upgrade paket, pembaruan runtime stabil jika kompatibel, restart PHP-FPM/PM2, dan ringkasan server langsung di terminal. **Tanpa** `healthchecks.tsv`, database, upload laporan, atau konfigurasi tambahan.
+Skrip Bash untuk audit server Ubuntu, upgrade runtime PHP/Node.js yang **sudah terpasang**, serta stop/start service terkelola dengan laporan langsung di terminal. Tanpa `healthchecks.tsv`, collector, atau upload data.
 
-**Versi:** v0.4.0
+**Versi: v0.4.2**
 
 ## Cara menggunakan
 
-### 1. Download file
+### 1. Download
 
 ```bash
-curl -fL --retry 3 -o ubuntu-maintenance-v03.sh https://raw.githubusercontent.com/vaisaldarmawan/updatephpandnodejs/main/ubuntu-maintenance-v03.sh
+curl -fL --retry 3 -o ubuntu-maintenance-v0.4.2.sh https://raw.githubusercontent.com/vaisaldarmawan/updatephpandnodejs/main/ubuntu-maintenance-v0.4.2.sh
 ```
 
 ### 2. Audit
 
 ```bash
-sudo bash ubuntu-maintenance-v03.sh --audit
+sudo bash ubuntu-maintenance-v0.4.2.sh --audit
 ```
 
-Hanya memeriksa: hostname, username, IP lokal/publik, CPU, RAM, disk, PHP, Node.js, PM2, systemd, dan proses aplikasi. **Tidak mengubah server.**
+Membaca versi PHP/Node.js, aplikasi yang memakai runtime tersebut, status systemd/PM2, hostname, username, IP, CPU, RAM, dan disk. Tidak mengubah sistem.
 
 ### 3. Apply
 
 ```bash
-sudo bash ubuntu-maintenance-v03.sh --apply
+sudo bash ubuntu-maintenance-v0.4.2.sh --apply
 ```
 
-Secara otomatis:
+Urutan: **deteksi versi → inventaris service → stop PHP-FPM/Node systemd/PM2 yang sebelumnya aktif → pembaruan APT dan runtime → start service yang dihentikan → verifikasi status dan laporan**. Jika upgrade gagal, skrip tetap mencoba menghidupkan kembali service yang telah dihentikan.
 
-- Menjalankan `apt-get update` dan `apt-get upgrade` untuk **semua paket APT yang memenuhi syarat**, bukan hanya PHP/Node.js.
-- Jika Node.js APT/NodeSource terpasang, mencoba migrasi ke **Node.js 24 LTS**. Jika ada proses Node tanpa supervisor yang bisa direstart, migrasi mayor **dilewati** supaya aplikasi tidak diputus mendadak; update APT biasa tetap dilanjutkan.
-- Jika PHP terpasang, memperbarui paketnya melalui APT dan mencoba migrasi **PHP CLI ke 8.5** hanya apabila paket tersedia di repository yang sudah aktif, semua ekstensi CLI yang diperlukan tersedia, serta tidak ada PHP-FPM/Apache/worker aktif yang perlu migrasi konfigurasi. **Tidak menambahkan PPA otomatis.** PHP-FPM tetap memakai versi/socket yang dikonfigurasi sampai dimigrasikan terpisah.
-- Me-restart service PHP-FPM yang sebelumnya aktif dan me-reload aplikasi PM2 yang sebelumnya `online`, satu per satu dengan identitas pemiliknya. Service systemd yang terdeteksi terdampak juga direstart.
-- Memeriksa ulang status service/proses dan versi runtime; menampilkan `[done]`, `[failed]`, dan peringatan yang relevan di terminal.
+- **Node.js:** instalasi NodeSource APT yang dikenali dimigrasikan ke **24.x LTS** (versi patch terbaru yang tersedia di repo), lalu diperiksa kembali. Instalasi NVM/asdf/fnm dan image container tidak otomatis dipindahkan ke major terbaru.
+- **PHP:** update paket APT yang terpasang. Migrasi PHP CLI ke **8.5.x** dicoba apabila paket dan ekstensi cocok di repositori yang tersedia. Situs PHP-FPM/Apache **tidak dipindahkan otomatis ke socket/pool PHP baru**; jika target belum tercapai, laporan menampilkan `FAIL`/`REVIEW`. Skrip tidak menambahkan PPA pihak ketiga secara diam-diam.
+- **Service:** hanya service systemd PHP/Node dan aplikasi PM2 **yang sebelumnya aktif** yang dihentikan dan dihidupkan kembali. Aplikasi proses mandiri (`screen`, `tmux`, `nohup`) **tidak dihentikan otomatis** karena skrip tidak memiliki cara yang andal untuk menghidupkannya kembali. Untuk server seperti `bot-gabungan`, `admin-panel` perlu dikelola systemd/PM2 atau direstart manual setelah upgrade runtime.
+- **Pemeriksaan:** status proses `active/online` saja tidak menjamin endpoint API, database, dan queue berfungsi dengan benar.
 
-> [!IMPORTANT]
-> **Skrip belum diuji melakukan upgrade mayor nyata di server produksi.** Jalankan dahulu di server canary dengan snapshot/backup dan maintenance window. Perpindahan Node/PHP mayor bisa membuat aplikasi tidak kompatibel, terutama native addon atau ekstensi PHP. Status `active`/`online` bukan bukti endpoint/DB/queue berfungsi normal. Tidak ada rollback atau reboot otomatis. Docker/Kubernetes harus diperbarui melalui image dan deployment-nya; NVM/asdf/fnm tidak dimigrasikan secara mayor otomatis.
+> [!WARNING]
+> `--apply` menyebabkan **downtime** pada layanan yang dihentikan dan memperbarui **seluruh paket APT**, bukan hanya PHP/Node.js. Simpan snapshot/backup, gunakan maintenance window dan uji terlebih dahulu pada server canary. Upgrade mayor dapat merusak kompatibilitas aplikasi. Tidak tersedia rollback paket otomatis maupun reboot otomatis.
 
 **Repository:** [vaisaldarmawan/updatephpandnodejs](https://github.com/vaisaldarmawan/updatephpandnodejs)
