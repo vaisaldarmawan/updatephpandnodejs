@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-SCRIPT_VERSION='0.5.0'
+SCRIPT_VERSION='0.5.1'
 MODE='audit'
 RUNTIME_ONLY=0
 ALLOW_CONTAINER=0
@@ -43,6 +43,10 @@ NODE_DIRECT_DIVERTED=()
 NODE_DIRECT_OLD_LINKS=()
 PHP_STABLE_SERIES='8.5'
 PHP_MIGRATED=0
+PHP_APACHE_SWITCHED=0
+PHP_APACHE_ROLLED_BACK=0
+PHP_APACHE_OLD_SERIES=''
+PHP_APACHE_WAS_ENABLED=0
 NODE_LTS_SKIPPED=0
 UNMANAGED_NODE_UPGRADE=0
 UNMANAGED_NODE_POST=0
@@ -69,12 +73,12 @@ FORCE_UNMANAGED_COUNT=0
 
 usage() {
 cat <<'HELP'
-Ubuntu Maintenance v0.5.0 — terminal-only (no report upload or saved logs)
+Ubuntu Maintenance v0.5.1 — terminal-only (no report upload or saved logs)
 
-  bash ubuntu-maintenance-v0.5.0.sh --audit             # regular user or root
-  sudo bash ubuntu-maintenance-v0.5.0.sh --audit        # fuller host inventory
-  bash ubuntu-maintenance-v0.5.0.sh --demo              # simulated terminal view
-  sudo bash ubuntu-maintenance-v0.5.0.sh --apply        # stop managed apps, upgrade runtimes, start and verify
+  bash ubuntu-maintenance-v0.5.1.sh --audit             # regular user or root
+  sudo bash ubuntu-maintenance-v0.5.1.sh --audit        # fuller host inventory
+  bash ubuntu-maintenance-v0.5.1.sh --demo              # simulated terminal view
+  sudo bash ubuntu-maintenance-v0.5.1.sh --apply        # stop managed apps, upgrade runtimes, start and verify
 
 Options:
   --audit                 Read-only inventory (default), supports non-root/container
@@ -102,7 +106,7 @@ Important:
 * Managed PHP/Node systemd services and online PM2 apps are stopped before changing packages and started afterward, including recovery attempts on failure. Local active Nginx/Apache is restarted after apps start, if its configuration test passes.
 * --force-restart-unmanaged (explicit opt-in) captures startup argv/cwd/env for standalone Node apps, terminates them and starts detached copies as the original user. This CHANGES Screen/Tmux behavior and redirects future stdout/stderr to /dev/null; interactive apps, dynamic startup wrappers and nonpersistent dependencies can fail. If metadata cannot be captured, the script aborts before stopping any app. Prefer systemd/PM2 for production.
 * A process with /proc/PID/exe marked (deleted), or an executable inode different from the current binary, is reported STALE on every run (audit and apply), including when APT changed no packages.
-* PHP 8.5 CLI + matching installed extensions are upgraded using APT (ppa:ondrej/php if needed). Active PHP-FPM virtual hosts are NOT blindly rewritten: old FPM remains serving until independently migrated; report will flag pending FPM cutover. Third-party PPA may use provider-specific changes/telemetry.
+* PHP 8.5 CLI + available matching extensions are installed using APT (ppa:ondrej/php if needed). OPcache is built into PHP 8.5 (no php8.5-opcache package). Enabled Apache mod_php is switched with configtest and rollback on failure; FPM virtual hosts are NOT blindly rewritten. Third-party PPA may use provider-specific changes/telemetry.
 * Apply needs no configuration file; HTTP GET is checked on identified local TCP ports and optional --check-url values. HTTP response checks do not guarantee database/queue functionality. During the stop→start window, monitored applications may be unavailable.
 * No automatic reboot, complete runtime rollback, or container orchestration actions. Review changed systemd interpreter paths and PHP virtual hosts.
 * apt-get itself can restart services before our controlled restart phase.
@@ -113,7 +117,7 @@ HELP
 demo() {
 cat <<'DEMO'
 ╔════════════════════════════════════════════════════════════════════╗
-║  UBUNTU MAINTENANCE v0.5.0 • SIMULASI (BUKAN HASIL SERVER ASLI)   ║
+║  UBUNTU MAINTENANCE v0.5.1 • SIMULASI (BUKAN HASIL SERVER ASLI)   ║
 ╚════════════════════════════════════════════════════════════════════╝
 [15:08:21] Mode              : APPLY
 [15:08:21] Hostname          : prod-api-01
@@ -1548,9 +1552,58 @@ php_enable_stable_repo() {
   fi
 }
 
+# PHP 8.5 bundles Zend OPcache in the runtime; there is no php8.5-opcache
+# package. Apache mod_php is moved only when the old module is actually
+# enabled. Keep the old Apache handler installed as a rollback candidate.
+php_apache_restore_handler() {
+  local newseries="$PHP_STABLE_SERIES" oldseries="$PHP_APACHE_OLD_SERIES"
+  [[ -n $oldseries && $PHP_APACHE_WAS_ENABLED -eq 1 ]] || return 0
+  if ! command -v a2dismod >/dev/null 2>&1 || ! command -v a2enmod >/dev/null 2>&1; then
+    err 'Pemulihan Apache gagal: a2dismod/a2enmod tidak tersedia.'
+    return 1
+  fi
+  a2dismod -f "php${newseries}" >"$TMP/php-apache-rollback.log" 2>&1 || true
+  if ! a2enmod "php${oldseries}" >>"$TMP/php-apache-rollback.log" 2>&1 ||
+     ! apache2ctl configtest >>"$TMP/php-apache-rollback.log" 2>&1; then
+    err "Tidak bisa mengembalikan Apache ke mod_php${oldseries}; periksa $TMP/php-apache-rollback.log sebelum sesi berakhir."
+    return 1
+  fi
+  if systemctl is-active --quiet apache2.service; then
+    if ! systemctl restart apache2.service >"$TMP/php-apache-rollback-restart.log" 2>&1; then
+      err "Konfigurasi lama dipulihkan, tetapi Apache gagal restart."
+      return 1
+    fi
+  fi
+  PHP_APACHE_SWITCHED=0
+  PHP_APACHE_ROLLED_BACK=1
+  warn "Handler Apache dikembalikan ke PHP ${oldseries}; PHP CLI baru tidak menjamin PHP website baru."
+  return 0
+}
+
+php_apache_cutover() {
+  local oldseries=$1
+  [[ $PHP_APACHE_WAS_ENABLED -eq 1 ]] || return 0
+  command -v a2dismod >/dev/null 2>&1 && command -v a2enmod >/dev/null 2>&1 && command -v apache2ctl >/dev/null 2>&1 || {
+    err 'Tool Apache tidak lengkap untuk migrasi mod_php.'
+    return 1
+  }
+  # Keep old mod_php on disk; move enabled Apache module only after both
+  # PHP CLI and extension validation have succeeded.
+  if ! a2dismod -f "php${oldseries}" >"$TMP/php-apache-switch.log" 2>&1 ||
+     ! a2enmod "php${PHP_STABLE_SERIES}" >>"$TMP/php-apache-switch.log" 2>&1 ||
+     ! apache2ctl configtest >>"$TMP/php-apache-switch.log" 2>&1; then
+    err 'Migrasi handler Apache tidak lolos configtest. Mengembalikan mod_php lama.'
+    php_apache_restore_handler || true
+    return 1
+  fi
+  PHP_APACHE_SWITCHED=1
+  ok "Apache mod_php${oldseries} → mod_php${PHP_STABLE_SERIES} (configtest PASS; URL diverifikasi sesudah start)."
+  return 0
+}
+
 php_stable_upgrade() {
   local oldver oldseries candidate oldmodules newmodules newbin oldreal wanted pkgname
-  local has_fpm=0 has_modphp=0 phpbin missing_modules
+  local has_fpm=0 has_modphp=0 phpbin missing_modules old_opcache new_opcache
   local -a installs=()
   phpbin=$(command -v php 2>/dev/null || true)
   [[ -n $phpbin && -x $phpbin && -x /usr/bin/php ]] || return 0
@@ -1571,7 +1624,12 @@ php_stable_upgrade() {
     return 1
   fi
   if ! php_enable_stable_repo; then return 1; fi
-  installs=("php${PHP_STABLE_SERIES}-cli")
+  installs=("php${PHP_STABLE_SERIES}-cli" "php${PHP_STABLE_SERIES}-common")
+  PHP_APACHE_WAS_ENABLED=0
+  PHP_APACHE_OLD_SERIES="$oldseries"
+  if [[ -e "/etc/apache2/mods-enabled/php${oldseries}.load" ]]; then
+    PHP_APACHE_WAS_ENABLED=1
+  fi
   # Match every versioned PHP extension whose target equivalent exists.
   # FPM and Apache packages can be installed side-by-side; moving the actual
   # site handler requires verified configuration, not merely a service start.
@@ -1580,6 +1638,9 @@ php_stable_upgrade() {
     wanted="php${PHP_STABLE_SERIES}-${pkgname#php${oldseries}-}"
     case "$wanted" in
       "php${PHP_STABLE_SERIES}-cli"|"php${PHP_STABLE_SERIES}-common") continue ;;
+      "php${PHP_STABLE_SERIES}-opcache")
+        log 'PHP OPcache: terintegrasi dalam PHP 8.5; tidak memerlukan paket php8.5-opcache.'
+        continue ;;
       *-dev|*-dbg|*-phpdbg) warn "Paket pengembangan $pkgname tidak otomatis dimigrasikan."; continue ;;
     esac
     if ! php_candidate "$wanted"; then
@@ -1594,10 +1655,12 @@ php_stable_upgrade() {
   if dpkg-query -W -f='${Status}' "php${oldseries}-fpm" 2>/dev/null | grep -q '^install ok installed$'; then has_fpm=1; fi
   if dpkg-query -W -f='${Status}' "libapache2-mod-php${oldseries}" 2>/dev/null | grep -q '^install ok installed$'; then has_modphp=1; fi
   if ((has_modphp)); then
-    # Do NOT install another mod_php automatically: its postinst may enable
-    # the new Apache handler immediately, before site compatibility tests.
-    warn 'Apache mod_php terpasang: PHP CLI/ekstensi dapat di-upgrade, handler Apache tetap perlu migrasi terencana.'
-    PHP_FPM_PENDING=1
+    # Install the new handler alongside the old one. Do not remove old mod_php;
+    # it is required for recovery if configuration / HTTP check fails.
+    installs+=("libapache2-mod-php${PHP_STABLE_SERIES}")
+    if ((PHP_APACHE_WAS_ENABLED==0)); then
+      log "Apache mod_php${oldseries} terpasang tetapi tidak aktif: handler Apache tidak dialihkan."
+    fi
   fi
   if ((has_fpm)); then installs+=("php${PHP_STABLE_SERIES}-fpm"); fi
   # Preserve installed package set: reject APT solutions that remove anything.
@@ -1610,6 +1673,7 @@ php_stable_upgrade() {
     return 1
   fi
   oldmodules=$(/usr/bin/php -m 2>/dev/null | sed -n '/^\[PHP Modules\]/,/^\[Zend Modules\]/{/^\[/d;/^$/d;p;}' | sort -u)
+  old_opcache=$(/usr/bin/php -r 'echo (int) extension_loaded("Zend OPcache");' 2>/dev/null || echo 0)
   if ! run_quiet "PHP ${PHP_STABLE_SERIES} Install" env DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none NEEDRESTART_MODE=l apt-get -qq -o DPkg::Lock::Timeout=60 -o Dpkg::Options::=--force-confold -y install "${installs[@]}"; then
     err 'PHP terbaru gagal dipasang; service lama akan dicoba hidupkan kembali.'
     return 1
@@ -1621,6 +1685,14 @@ php_stable_upgrade() {
     return 1
   fi
   newmodules=$("$newbin" -m 2>/dev/null | sed -n '/^\[PHP Modules\]/,/^\[Zend Modules\]/{/^\[/d;/^$/d;p;}' | sort -u)
+  new_opcache=$("$newbin" -r 'echo (int) extension_loaded("Zend OPcache");' 2>/dev/null || echo 0)
+  if [[ $old_opcache == 1 && $new_opcache != 1 ]]; then
+    if [[ -n $oldreal ]] && update-alternatives --list php 2>/dev/null | grep -Fxq "$oldreal"; then
+      update-alternatives --set php "$oldreal" >/dev/null 2>&1 || true
+    fi
+    err 'OPcache tersedia pada PHP lama, tetapi tidak aktif pada PHP 8.5; migrasi dibatalkan.'
+    return 1
+  fi
   missing_modules=$(comm -23 <(printf '%s\n' "$oldmodules") <(printf '%s\n' "$newmodules") || true)
   if [[ -n $missing_modules ]]; then
     # APT install may auto-switch php alternatives: revert before failure.
@@ -1637,6 +1709,17 @@ php_stable_upgrade() {
   if ! run_quiet 'PHP CLI Switch' update-alternatives --set php "$newbin"; then return 1; fi
   PHP_MIGRATED=1
   ok "PHP CLI $oldver → $(/usr/bin/php -r 'echo PHP_VERSION;' 2>/dev/null || echo '?')"
+  if ((PHP_APACHE_WAS_ENABLED)); then
+    if ! php_apache_cutover "$oldseries"; then
+      # The original CLI remains available; restore the original default
+      # too, to avoid reporting a partially successful PHP migration.
+      if [[ -n $oldreal ]] && update-alternatives --list php 2>/dev/null | grep -Fxq "$oldreal"; then
+        update-alternatives --set php "$oldreal" >/dev/null 2>&1 || true
+      fi
+      PHP_MIGRATED=0
+      return 1
+    fi
+  fi
   if ((has_fpm)); then
     # Install/start the new FPM daemon but do not blindly edit nginx/apache
     # vhosts, pool sockets, or custom pool configurations.
@@ -1712,6 +1795,7 @@ if [[ $MODE == apply ]]; then
   if (( STOP_PHASE_ENTERED == 1 )); then
     if ! bring_back_managed; then
       err 'Sebagian service gagal dihidupkan; periksa status secara manual.'
+      if ((PHP_APACHE_SWITCHED)); then php_apache_restore_handler || true; fi
     fi
   elif (( RESTART==0 )); then
     warn 'Stop/start otomatis tidak dijalankan (--no-restart).'
@@ -1843,6 +1927,13 @@ fi
 if [[ -s $TMP/web-endpoints ]]; then
   web_probe "$TMP/web-after" AFTER
   web_compare
+  if ((WEB_HEALTH_FAIL>0 && PHP_APACHE_SWITCHED>0)); then
+    err 'Web gagal setelah migrasi mod_php; mencoba mengembalikan handler Apache lama.'
+    if php_apache_restore_handler; then
+      web_probe "$TMP/web-rollback" ROLLBACK
+      log 'Endpoint diperiksa ulang setelah pemulihan Apache; hasil maintenance tetap FAIL.'
+    fi
+  fi
 else
   log 'Tidak ada URL yang diuji. Status aplikasi hanya berdasarkan proses/service.'
 fi
@@ -1883,6 +1974,15 @@ printf 'CPU               : %s%% (%s)\n' "$CPU_USED" "$CPU_VIEW"
 printf 'RAM               : %s / %s GiB used | %s GiB available\n' "$(gib "$MEM_USED")" "$(gib "$MEM_TOTAL")" "$(gib "$MEM_AVAIL")"
 printf 'Disk %-12s : %s / %s GiB used | %s GiB free\n' "$DISK_PATH" "$(gib "$DISK_USED")" "$(gib "$DISK_TOTAL")" "$(gib "$DISK_AVAIL")"
 printf 'PHP               : %s -> %s\n' "$PHP_OLD" "$PHP_NEW"
+if ((PHP_APACHE_WAS_ENABLED)); then
+  if ((PHP_APACHE_SWITCHED)); then
+    printf 'Apache PHP handler: %s -> %s (configtest OK; URL checked)\n' "$PHP_APACHE_OLD_SERIES" "$PHP_STABLE_SERIES"
+  elif ((PHP_APACHE_ROLLED_BACK)); then
+    printf 'Apache PHP handler: %s -> %s (rollback)\n' "$PHP_APACHE_OLD_SERIES" "$PHP_APACHE_OLD_SERIES"
+  else
+    printf 'Apache PHP handler: %s (unchanged)\n' "$PHP_APACHE_OLD_SERIES"
+  fi
+fi
 printf 'Node.js (%s): %s -> %s\n' "$CURRENT_NODE_PATH" "$NODE_OLD" "$NODE_NEW"
 if ((UNMANAGED_NODE_POST>0)); then printf 'Node apps pending  : %s perlu restart/cek runtime (executable lama masih berjalan)\n' "$UNMANAGED_NODE_POST"; fi
 if [[ -s $TMP/nvm-after ]]; then printf 'NVM installations : %s detected (not necessarily active)\n' "$(wc -l < "$TMP/nvm-after")"; fi
