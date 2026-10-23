@@ -2,7 +2,7 @@
 
 Script Bash untuk audit server Ubuntu, memperbarui paket APT, me-restart service terkait, dan menampilkan laporan **langsung di terminal**.
 
-**Versi:** v0.3.3 · **Tidak memerlukan** file `healthchecks.tsv` atau konfigurasi tambahan.
+**Versi:** v0.3.4 · **Tidak memerlukan** file `healthchecks.tsv` atau konfigurasi tambahan.
 
 ## Cara menggunakan
 
